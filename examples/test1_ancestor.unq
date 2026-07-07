@@ -1,0 +1,26 @@
+# Test 1: Transitive closure (ancestor)
+# If X is parent of Y, then X is ancestor of Y
+# If X is parent of Z, and Z is ancestor of Y, then X is ancestor of Y
+
+entity Person
+relation Parent(Person, Person)
+
+# Base case: direct parent is ancestor
+derive ancestor(x, y)
+  from Parent(x, y)
+
+# Recursive case: parent of ancestor is ancestor
+derive ancestor(x, y)
+  from Parent(x, z), ancestor(z, y)
+
+input {
+  Parent(Alice, Bob)
+  Parent(Bob, Charlie)
+  Parent(Charlie, David)
+}
+
+query ancestor(Alice, Bob)
+query ancestor(Alice, Charlie)
+query ancestor(Alice, David)
+query ancestor(Bob, David)
+query ancestor(David, Alice)

@@ -1,0 +1,30 @@
+# Task readiness example
+# A task is ready when it exists and is not blocked.
+# A task is blocked if any dependency is not finished.
+
+entity Task
+relation Dependency(Task, Task)
+relation Finished(Task)
+
+# Define intermediate: a task is blocked if it depends on something not finished
+derive blocked(t)
+  from Dependency(t, other), not Finished(other)
+
+# Define observable: a task is ready if it exists and is not blocked
+observe ready(t)
+  where Task(t), not blocked(t)
+
+# Input facts
+input {
+  Task(TaskA)
+  Task(TaskB)
+  Task(TaskC)
+  Dependency(TaskB, TaskA)
+  Dependency(TaskC, TaskB)
+  Finished(TaskA)
+}
+
+# Queries — should return TRUE, TRUE, FALSE respectively
+query ready(TaskA)
+query ready(TaskB)
+query ready(TaskC)

@@ -1,0 +1,16 @@
+# Aggregate example: total price per order
+
+entity Order
+relation OrderItem(Order, OrderItem)
+
+derive total_price(order, sum_val)
+  from sum_val = sum(OrderItem(order, price), price)
+
+input {
+  OrderItem(Order1, 100)
+  OrderItem(Order1, 50)
+  OrderItem(Order2, 200)
+}
+
+query total_price(Order1, 150)
+query total_price(Order2, 200)

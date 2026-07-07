@@ -1,0 +1,22 @@
+# Test 3: Task dependencies
+# A task is blocked if any dependency is not finished
+
+entity Task
+relation Depends(Task, Task)
+relation Finished(Task)
+
+derive blocked(t)
+  from Depends(t, dep), not Finished(dep)
+
+input {
+  Task(T1)
+  Task(T2)
+  Task(T3)
+  Depends(T2, T1)
+  Depends(T3, T2)
+  Finished(T1)
+}
+
+query blocked(T1)
+query blocked(T2)
+query blocked(T3)

@@ -1,0 +1,13 @@
+# Test 7: Self-negation (should be rejected by validator)
+# Paradox: X is special if X is not special
+
+entity Item
+
+derive special(x)
+  from Item(x), not special(x)
+
+input {
+  Item(A)
+}
+
+query special(A)
