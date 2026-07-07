@@ -116,7 +116,7 @@ void config_dump(const Config *c) {
 }
 
 /* ====================================================================== */
-/* Expression evaluator                                                    */
+/* Expression evaluator (for arithmetic rules)                            */
 /* ====================================================================== */
 
 typedef struct {
@@ -162,397 +162,499 @@ static double eval_expr(const Expr *e, const VarBindings *binds) {
 }
 
 /* ====================================================================== */
-/* Rule application                                                        */
+/* Aggregate rules (special-case, unchanged)                              */
 /* ====================================================================== */
 
-static int apply_rule(Config *c, const Rule *r) {
+static int apply_rule_aggregate(Config *c, const Rule *r) {
     int added = 0;
+    char *agg_func = r->aggregate_funcs[0];
+    int agg_field = r->aggregate_fields[0];
+    int src_arity = r->body_arities[0];
+    int dst_arity = r->head_arity;
     
-    /* Aggregate rules */
-    if (r->aggregate_funcs && r->aggregate_funcs[0]) {
-        char *agg_func = r->aggregate_funcs[0];
-        int agg_field = r->aggregate_fields[0];
-        int src_arity = r->body_arities[0];
-        int dst_arity = r->head_arity;
+    typedef struct {
+        char **key;
+        int key_count;
+        double sum;
+        int count;
+        double min;
+        double max;
+    } Group;
+    
+    Group *groups = NULL;
+    int group_count = 0;
+    int group_capacity = 0;
+    
+    for (Fact *f = c->facts; f; f = f->next) {
+        if (strcmp(f->predicate, r->body_preds[0]) != 0) continue;
+        if (f->arity != src_arity) continue;
         
-        typedef struct {
-            char **key;
-            int key_count;
-            double sum;
-            int count;
-            double min;
-            double max;
-        } Group;
-        
-        Group *groups = NULL;
-        int group_count = 0;
-        int group_capacity = 0;
-        
-        for (Fact *f = c->facts; f; f = f->next) {
-            if (strcmp(f->predicate, r->body_preds[0]) != 0) continue;
-            if (f->arity != src_arity) continue;
-            
-            int key_count = src_arity - 1;
-            char **key = malloc(sizeof(char*) * key_count);
-            int ki = 0;
-            for (int i = 0; i < src_arity; i++) {
-                if (i != agg_field) {
-                    key[ki++] = f->args[i];
-                }
+        int key_count = src_arity - 1;
+        char **key = malloc(sizeof(char*) * key_count);
+        int ki = 0;
+        for (int i = 0; i < src_arity; i++) {
+            if (i != agg_field) {
+                key[ki++] = f->args[i];
             }
-            
-            char *endptr;
-            double value = strtod(f->args[agg_field], &endptr);
-            if (*endptr != '\0') {
-                free(key);
-                continue;
-            }
-            
-            Group *g = NULL;
-            for (int i = 0; i < group_count; i++) {
-                int match = 1;
-                for (int j = 0; j < key_count; j++) {
-                    if (strcmp(groups[i].key[j], key[j]) != 0) {
-                        match = 0;
-                        break;
-                    }
-                }
-                if (match) {
-                    g = &groups[i];
-                    free(key);
+        }
+        
+        char *endptr;
+        double value = strtod(f->args[agg_field], &endptr);
+        if (*endptr != '\0') {
+            free(key);
+            continue;
+        }
+        
+        Group *g = NULL;
+        for (int i = 0; i < group_count; i++) {
+            int match = 1;
+            for (int j = 0; j < key_count; j++) {
+                if (strcmp(groups[i].key[j], key[j]) != 0) {
+                    match = 0;
                     break;
                 }
             }
-            
-            if (!g) {
-                if (group_count >= group_capacity) {
-                    group_capacity = group_capacity == 0 ? 16 : group_capacity * 2;
-                    groups = realloc(groups, sizeof(Group) * group_capacity);
-                }
-                g = &groups[group_count++];
-                g->key = key;
-                g->key_count = key_count;
-                g->sum = 0;
-                g->count = 0;
-                g->min = value;
-                g->max = value;
-            }
-            
-            g->sum += value;
-            g->count++;
-            if (value < g->min) g->min = value;
-            if (value > g->max) g->max = value;
-        }
-        
-        for (int i = 0; i < group_count; i++) {
-            Group *g = &groups[i];
-            double result;
-            if (strcmp(agg_func, "sum") == 0) result = g->sum;
-            else if (strcmp(agg_func, "count") == 0) result = g->count;
-            else if (strcmp(agg_func, "min") == 0) result = g->min;
-            else if (strcmp(agg_func, "max") == 0) result = g->max;
-            else { free(g->key); continue; }
-            
-            char **args = malloc(sizeof(char*) * dst_arity);
-            int ai = 0;
-            for (int j = 0; j < g->key_count; j++) {
-                args[ai++] = g->key[j];
-            }
-            char buf[64];
-            if (result == (int)result && fabs(result) < 1e15) {
-                snprintf(buf, sizeof(buf), "%d", (int)result);
-            } else {
-                snprintf(buf, sizeof(buf), "%.2f", result);
-            }
-            args[ai] = strdup(buf);
-            
-            if (!fact_exists(c, r->head, dst_arity, args)) {
-                add_fact_direct(c, r->head, dst_arity, args);
-                added++;
-            } else {
-                free(args[ai]);
-            }
-            free(args);
-            free(g->key);
-        }
-        free(groups);
-        
-        return added;
-    }
-    
-    /* Arithmetic rules: head(...) <- body1(...), ..., result = expr */
-    int has_arith = 0;
-    int arith_slot = -1;
-    if (r->arith_exprs) {
-        for (int i = 0; i < r->body_count; i++) {
-            if (r->arith_exprs[i]) {
-                has_arith = 1;
-                arith_slot = i;
+            if (match) {
+                g = &groups[i];
+                free(key);
                 break;
             }
         }
+        
+        if (!g) {
+            if (group_count >= group_capacity) {
+                group_capacity = group_capacity == 0 ? 16 : group_capacity * 2;
+                groups = realloc(groups, sizeof(Group) * group_capacity);
+            }
+            g = &groups[group_count++];
+            g->key = key;
+            g->key_count = key_count;
+            g->sum = 0;
+            g->count = 0;
+            g->min = value;
+            g->max = value;
+        }
+        
+        g->sum += value;
+        g->count++;
+        if (value < g->min) g->min = value;
+        if (value > g->max) g->max = value;
     }
     
-    if (has_arith) {
-        /* Count and collect regular (non-arithmetic) body atoms */
-        int regular_slots[16];
-        int regular_count = 0;
-        for (int i = 0; i < r->body_count && regular_count < 16; i++) {
-            if (strcmp(r->body_preds[i], "__arith__") != 0) {
-                regular_slots[regular_count++] = i;
+    for (int i = 0; i < group_count; i++) {
+        Group *g = &groups[i];
+        double result;
+        if (strcmp(agg_func, "sum") == 0) result = g->sum;
+        else if (strcmp(agg_func, "count") == 0) result = g->count;
+        else if (strcmp(agg_func, "min") == 0) result = g->min;
+        else if (strcmp(agg_func, "max") == 0) result = g->max;
+        else { free(g->key); continue; }
+        
+        char **args = malloc(sizeof(char*) * dst_arity);
+        int ai = 0;
+        for (int j = 0; j < g->key_count; j++) {
+            args[ai++] = g->key[j];
+        }
+        char buf[64];
+        if (result == (int)result && fabs(result) < 1e15) {
+            snprintf(buf, sizeof(buf), "%d", (int)result);
+        } else {
+            snprintf(buf, sizeof(buf), "%.2f", result);
+        }
+        args[ai] = strdup(buf);
+        
+        if (!fact_exists(c, r->head, dst_arity, args)) {
+            add_fact_direct(c, r->head, dst_arity, args);
+            added++;
+        } else {
+            free(args[ai]);
+        }
+        free(args);
+        free(g->key);
+    }
+    free(groups);
+    
+    return added;
+}
+
+/* ====================================================================== */
+/* Arithmetic rules (special-case, unchanged)                             */
+/* ====================================================================== */
+
+static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
+    int added = 0;
+    
+    /* Find all regular (non-arithmetic) body atoms */
+    int regular_slots[16];
+    int regular_count = 0;
+    for (int i = 0; i < r->body_count && regular_count < 16; i++) {
+        if (strcmp(r->body_preds[i], "__arith__") != 0) {
+            regular_slots[regular_count++] = i;
+        }
+    }
+    
+    if (regular_count == 0) return added;
+    
+    /* Collect matching facts for each regular body atom */
+    Fact **fact_lists[16];
+    int fact_counts[16];
+    
+    for (int s = 0; s < regular_count; s++) {
+        int slot = regular_slots[s];
+        fact_lists[s] = NULL;
+        fact_counts[s] = 0;
+        int fact_cap = 0;
+        
+        for (Fact *f = c->facts; f; f = f->next) {
+            if (strcmp(f->predicate, r->body_preds[slot]) != 0) continue;
+            if (f->arity != r->body_arities[slot]) continue;
+            
+            if (fact_counts[s] >= fact_cap) {
+                fact_cap = fact_cap == 0 ? 16 : fact_cap * 2;
+                fact_lists[s] = realloc(fact_lists[s], sizeof(Fact*) * fact_cap);
+            }
+            fact_lists[s][fact_counts[s]++] = f;
+        }
+    }
+    
+    /* Iterate through all combinations (cross product) */
+    int indices[16] = {0};
+    
+    while (1) {
+        int valid = 1;
+        for (int s = 0; s < regular_count; s++) {
+            if (indices[s] >= fact_counts[s]) {
+                valid = 0;
+                break;
             }
         }
+        if (!valid) break;
         
-        if (regular_count == 0) return added;
+        Fact *current_facts[16];
+        int total_args = 0;
+        for (int s = 0; s < regular_count; s++) {
+            current_facts[s] = fact_lists[s][indices[s]];
+            total_args += current_facts[s]->arity;
+        }
         
-        /* Collect matching facts for each regular body atom */
-        Fact **fact_lists[16];
-        int fact_counts[16];
+        /* Build variable bindings: args become "arg0", "arg1", ... */
+        char **bind_names = malloc(sizeof(char*) * total_args);
+        const char **bind_values = malloc(sizeof(const char*) * total_args);
+        int bind_count = 0;
+        char name_bufs[64][32];
         
         for (int s = 0; s < regular_count; s++) {
-            int slot = regular_slots[s];
-            fact_lists[s] = NULL;
-            fact_counts[s] = 0;
-            int fact_cap = 0;
-            
-            for (Fact *f = c->facts; f; f = f->next) {
-                if (strcmp(f->predicate, r->body_preds[slot]) != 0) continue;
-                if (f->arity != r->body_arities[slot]) continue;
-                
-                if (fact_counts[s] >= fact_cap) {
-                    fact_cap = fact_cap == 0 ? 16 : fact_cap * 2;
-                    fact_lists[s] = realloc(fact_lists[s], sizeof(Fact*) * fact_cap);
-                }
-                fact_lists[s][fact_counts[s]++] = f;
+            Fact *f = current_facts[s];
+            for (int a = 0; a < f->arity; a++) {
+                snprintf(name_bufs[bind_count], 32, "arg%d", bind_count);
+                bind_names[bind_count] = strdup(name_bufs[bind_count]);
+                bind_values[bind_count] = f->args[a];
+                bind_count++;
             }
         }
         
-        /* Iterate through all combinations (cross product) */
-        int indices[16] = {0};
+        VarBindings binds;
+        binds.names = (const char**)bind_names;
+        binds.values = bind_values;
+        binds.count = bind_count;
         
-        while (1) {
-            /* Check if current indices are valid */
-            int valid = 1;
-            for (int s = 0; s < regular_count; s++) {
-                if (indices[s] >= fact_counts[s]) {
-                    valid = 0;
+        double val = eval_expr(r->arith_exprs[arith_slot], &binds);
+        
+        /* Build head args */
+        char **result_args = malloc(sizeof(char*) * r->head_arity);
+        int filled = 0;
+        
+        for (int s = 0; s < regular_count && filled < r->head_arity - 1; s++) {
+            Fact *f = current_facts[s];
+            for (int a = 0; a < f->arity && filled < r->head_arity - 1; a++) {
+                result_args[filled++] = f->args[a];
+            }
+        }
+        
+        while (filled < r->head_arity - 1) {
+            result_args[filled++] = "";
+        }
+        
+        char buf[64];
+        if (val == (int)val && fabs(val) < 1e15) {
+            snprintf(buf, sizeof(buf), "%d", (int)val);
+        } else {
+            snprintf(buf, sizeof(buf), "%.2f", val);
+        }
+        result_args[r->head_arity - 1] = strdup(buf);
+        
+        if (!fact_exists(c, r->head, r->head_arity, result_args)) {
+            add_fact_direct(c, r->head, r->head_arity, result_args);
+            added++;
+        }
+        
+        free(result_args[r->head_arity - 1]);
+        free(result_args);
+        
+        for (int i = 0; i < bind_count; i++) free(bind_names[i]);
+        free(bind_names);
+        free(bind_values);
+        
+        /* Increment indices (odometer) */
+        int carry = 1;
+        for (int s = regular_count - 1; s >= 0 && carry; s--) {
+            indices[s]++;
+            if (indices[s] < fact_counts[s]) {
+                carry = 0;
+            } else {
+                indices[s] = 0;
+            }
+        }
+        if (carry) break;
+    }
+    
+    for (int s = 0; s < regular_count; s++) {
+        free(fact_lists[s]);
+    }
+    
+    return added;
+}
+
+/* ====================================================================== */
+/* GENERAL N-WAY JOIN — replaces all hardcoded patterns                   */
+/* ====================================================================== */
+
+static int apply_rule_general(Config *c, const Rule *r) {
+    if (r->body_count == 0) return 0;
+    
+    /* Step 1: Separate positive and negative body atoms */
+    int pos_indices[32], neg_indices[32];
+    int pos_count = 0, neg_count = 0;
+    
+    for (int i = 0; i < r->body_count; i++) {
+        if (r->body_negative[i]) {
+            neg_indices[neg_count++] = i;
+        } else {
+            pos_indices[pos_count++] = i;
+        }
+    }
+    
+    if (pos_count == 0) return 0;
+    
+    /* Step 2: Collect matching facts for each positive atom */
+    Fact ***pos_fact_lists = malloc(sizeof(Fact**) * pos_count);
+    int *pos_fact_counts = calloc(pos_count, sizeof(int));
+    
+    for (int p = 0; p < pos_count; p++) {
+        int atom_idx = pos_indices[p];
+        const char *pred = r->body_preds[atom_idx];
+        int arity = r->body_arities[atom_idx];
+        
+        int count = 0;
+        for (Fact *f = c->facts; f; f = f->next) {
+            if (strcmp(f->predicate, pred) == 0 && f->arity == arity) {
+                count++;
+            }
+        }
+        
+        pos_fact_counts[p] = count;
+        pos_fact_lists[p] = count > 0 ? malloc(sizeof(Fact*) * count) : NULL;
+        
+        int fi = 0;
+        for (Fact *f = c->facts; f; f = f->next) {
+            if (strcmp(f->predicate, pred) == 0 && f->arity == arity) {
+                pos_fact_lists[p][fi++] = f;
+            }
+        }
+        
+        if (count == 0) {
+            for (int j = 0; j <= p; j++) {
+                if (pos_fact_lists[j]) free(pos_fact_lists[j]);
+            }
+            free(pos_fact_lists);
+            free(pos_fact_counts);
+            return 0;
+        }
+    }
+    
+    /* Step 3: Create mapping from global atom_idx to positive position */
+    int atom_to_pos[32];
+    for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
+    for (int p = 0; p < pos_count; p++) {
+        atom_to_pos[pos_indices[p]] = p;
+    }
+    
+    /* Step 4: Iterate through all combinations */
+    int *indices = calloc(pos_count, sizeof(int));
+    int added = 0;
+    
+    char **binding_values = r->arg_binding_count > 0
+        ? malloc(sizeof(char*) * r->arg_binding_count)
+        : NULL;
+    
+    while (1) {
+        int valid_indices = 1;
+        for (int p = 0; p < pos_count; p++) {
+            if (indices[p] >= pos_fact_counts[p]) {
+                valid_indices = 0;
+                break;
+            }
+        }
+        if (!valid_indices) break;
+        
+        Fact *current_facts[32];
+        for (int p = 0; p < pos_count; p++) {
+            current_facts[p] = pos_fact_lists[p][indices[p]];
+        }
+        
+        /* Step 5: Build bindings — only from POSITIVE atoms */
+        int combination_valid = 1;
+        
+        for (int b = 0; b < r->arg_binding_count; b++) {
+            ArgBinding *bind = &r->arg_bindings[b];
+            
+            /* Find first location in a positive atom */
+            int first_pos_loc = -1;
+            for (int l = 0; l < bind->location_count; l++) {
+                int atom_idx = bind->locations[l].atom_index;
+                if (atom_to_pos[atom_idx] >= 0) {
+                    first_pos_loc = l;
                     break;
                 }
             }
-            if (!valid) break;
             
-            /* Get current combination of facts */
-            Fact *current_facts[16];
-            int total_args = 0;
-            for (int s = 0; s < regular_count; s++) {
-                current_facts[s] = fact_lists[s][indices[s]];
-                total_args += current_facts[s]->arity;
+            if (first_pos_loc < 0) {
+                /* Variable not bound by any positive atom — should not happen */
+                combination_valid = 0;
+                break;
             }
             
-            /* Build variable bindings: args become "arg0", "arg1", ...
-             * in order of body atoms, then args within each atom. */
-            char **bind_names = malloc(sizeof(char*) * total_args);
-            const char **bind_values = malloc(sizeof(const char*) * total_args);
-            int bind_count = 0;
+            ArgLocation *first = &bind->locations[first_pos_loc];
+            int pos_idx = atom_to_pos[first->atom_index];
+            char *value = current_facts[pos_idx]->args[first->arg_index];
+            binding_values[b] = value;
             
-            for (int s = 0; s < regular_count; s++) {
-                Fact *f = current_facts[s];
-                for (int a = 0; a < f->arity; a++) {
-                    char buf[32];
-                    snprintf(buf, sizeof(buf), "arg%d", bind_count);
-                    bind_names[bind_count] = strdup(buf);
-                    bind_values[bind_count] = f->args[a];
-                    bind_count++;
-                }
-            }
-            
-            VarBindings binds;
-            binds.names = (const char**)bind_names;
-            binds.values = bind_values;
-            binds.count = bind_count;
-            
-            /* Evaluate expression */
-            double val = eval_expr(r->arith_exprs[arith_slot], &binds);
-            
-            /* Build head fact args: use first body fact's args as base,
-             * append computed value as last arg */
-            char **result_args = malloc(sizeof(char*) * r->head_arity);
-            int filled = 0;
-            
-            for (int s = 0; s < regular_count && filled < r->head_arity - 1; s++) {
-                Fact *f = current_facts[s];
-                for (int a = 0; a < f->arity && filled < r->head_arity - 1; a++) {
-                    result_args[filled++] = f->args[a];
-                }
-            }
-            
-            /* Pad with empty strings if not enough args */
-            while (filled < r->head_arity - 1) {
-                result_args[filled++] = "";
-            }
-            
-            /* Last arg is the computed value */
-            char buf[64];
-            if (val == (int)val && fabs(val) < 1e15) {
-                snprintf(buf, sizeof(buf), "%d", (int)val);
-            } else {
-                snprintf(buf, sizeof(buf), "%.2f", val);
-            }
-            result_args[r->head_arity - 1] = strdup(buf);
-            
-            if (!fact_exists(c, r->head, r->head_arity, result_args)) {
-                add_fact_direct(c, r->head, r->head_arity, result_args);
-                added++;
-            }
-            
-            /* Free only the strdup'd parts */
-            free(result_args[r->head_arity - 1]);
-            free(result_args);
-            
-            /* Free bindings */
-            for (int i = 0; i < bind_count; i++) free(bind_names[i]);
-            free(bind_names);
-            free(bind_values);
-            
-            /* Advance to next combination */
-            int carry = 1;
-            for (int s = regular_count - 1; s >= 0 && carry; s--) {
-                indices[s]++;
-                if (indices[s] < fact_counts[s]) {
-                    carry = 0;
-                } else {
-                    indices[s] = 0;
-                }
-            }
-            if (carry) break;
-        }
-        
-        /* Free fact lists */
-        for (int s = 0; s < regular_count; s++) {
-            free(fact_lists[s]);
-        }
-        
-        return added;
-    }
-    
-    /* Simple copy rule: head(X) <- body(X) */
-    if (r->body_count == 1 && !r->is_recursive && !r->body_negative[0]) {
-        for (Fact *f = c->facts; f; f = f->next) {
-            if (strcmp(f->predicate, r->body_preds[0]) == 0 &&
-                f->arity == r->head_arity) {
-                if (!fact_exists(c, r->head, f->arity, f->args)) {
-                    add_fact_direct(c, r->head, f->arity, f->args);
-                    added++;
-                }
-            }
-        }
-    }
-    /* Transitive closure rule with arity 2 */
-    else if (r->body_count == 2 && r->is_recursive && r->head_arity == 2 &&
-             !r->body_negative[0] && !r->body_negative[1]) {
-        int rec_idx = -1, ext_idx = -1;
-        if (strcmp(r->body_preds[0], r->head) == 0) {
-            rec_idx = 0; ext_idx = 1;
-        } else if (strcmp(r->body_preds[1], r->head) == 0) {
-            rec_idx = 1; ext_idx = 0;
-        }
-        
-        if (rec_idx < 0) return added;
-        
-        Fact **head_facts = NULL;
-        int head_count = 0, head_capacity = 0;
-        
-        for (Fact *f = c->facts; f; f = f->next) {
-            if (strcmp(f->predicate, r->head) == 0 && f->arity == 2) {
-                if (head_count >= head_capacity) {
-                    head_capacity = head_capacity == 0 ? 16 : head_capacity * 2;
-                    head_facts = realloc(head_facts, sizeof(Fact*) * head_capacity);
-                }
-                head_facts[head_count++] = f;
-            }
-        }
-        
-        if (rec_idx == 0) {
-            for (int i = 0; i < head_count; i++) {
-                Fact *hf = head_facts[i];
-                const char *x = hf->args[0];
-                const char *z = hf->args[1];
+            /* Check unification with other POSITIVE atom locations */
+            for (int l = 0; l < bind->location_count; l++) {
+                if (l == first_pos_loc) continue;
                 
-                for (Fact *ef = c->facts; ef; ef = ef->next) {
-                    if (strcmp(ef->predicate, r->body_preds[ext_idx]) == 0 &&
-                        ef->arity == 2 && strcmp(ef->args[0], z) == 0) {
-                        char *new_args[2] = { (char*)x, ef->args[1] };
-                        if (!fact_exists(c, r->head, 2, new_args)) {
-                            add_fact_direct(c, r->head, 2, new_args);
-                            added++;
-                        }
-                    }
+                int atom_idx = bind->locations[l].atom_index;
+                int pos = atom_to_pos[atom_idx];
+                if (pos < 0) continue; /* Skip negative atoms */
+                
+                char *other = current_facts[pos]->args[bind->locations[l].arg_index];
+                if (strcmp(value, other) != 0) {
+                    combination_valid = 0;
+                    break;
                 }
             }
-        } else {
-            for (Fact *ef = c->facts; ef; ef = ef->next) {
-                if (strcmp(ef->predicate, r->body_preds[ext_idx]) == 0 && ef->arity == 2) {
-                    const char *x = ef->args[0];
-                    const char *z = ef->args[1];
-                    
-                    for (int i = 0; i < head_count; i++) {
-                        Fact *hf = head_facts[i];
-                        if (strcmp(hf->args[0], z) == 0) {
-                            char *new_args[2] = { (char*)x, hf->args[1] };
-                            if (!fact_exists(c, r->head, 2, new_args)) {
-                                add_fact_direct(c, r->head, 2, new_args);
-                                added++;
+            if (!combination_valid) break;
+        }
+        
+        /* Step 6: Check negative atoms */
+        if (combination_valid) {
+            for (int n = 0; n < neg_count && combination_valid; n++) {
+                int atom_idx = neg_indices[n];
+                const char *pred = r->body_preds[atom_idx];
+                int arity = r->body_arities[atom_idx];
+                
+                char *neg_args[32];
+                int all_bound = 1;
+                
+                for (int j = 0; j < arity; j++) {
+                    int found_binding = -1;
+                    for (int b = 0; b < r->arg_binding_count; b++) {
+                        ArgBinding *bind = &r->arg_bindings[b];
+                        for (int l = 0; l < bind->location_count; l++) {
+                            if (bind->locations[l].atom_index == atom_idx &&
+                                bind->locations[l].arg_index == j) {
+                                found_binding = b;
+                                goto found;
                             }
                         }
                     }
+                    found:
+                    
+                    if (found_binding < 0) {
+                        all_bound = 0;
+                        break;
+                    }
+                    neg_args[j] = binding_values[found_binding];
+                }
+                
+                if (all_bound && fact_exists(c, pred, arity, neg_args)) {
+                    combination_valid = 0;
                 }
             }
         }
-        free(head_facts);
-    }
-    /* Negation rule: head(X) <- pos(X), not neg(X) */
-    else if (r->body_count == 2 && !r->is_recursive &&
-             r->head_arity == 1 &&
-             r->body_arities[0] == 1 && !r->body_negative[0] &&
-             r->body_arities[1] == 1 && r->body_negative[1]) {
-
-        for (Fact *f = c->facts; f; f = f->next) {
-            if (strcmp(f->predicate, r->body_preds[0]) == 0 && f->arity == 1) {
-                char *x = f->args[0];
-                char *neg_args[1] = { x };
-                if (!fact_exists(c, r->body_preds[1], 1, neg_args)) {
-                    char *head_args[1] = { x };
-                    if (!fact_exists(c, r->head, 1, head_args)) {
-                        add_fact_direct(c, r->head, 1, head_args);
-                        added++;
+        
+        /* Step 7: Build head fact */
+        if (combination_valid && r->head_arity > 0) {
+            char *head_args[32];
+            int head_valid = 1;
+            
+            for (int j = 0; j < r->head_arity; j++) {
+                int found_binding = -1;
+                for (int b = 0; b < r->arg_binding_count; b++) {
+                    if (r->arg_bindings[b].is_head &&
+                        r->arg_bindings[b].head_arg_index == j) {
+                        found_binding = b;
+                        break;
                     }
                 }
-            }
-        }
-    }
-    /* Negation rule with arity mismatch: head(X) <- pos(X, Y), not neg(Y) */
-    else if (r->body_count == 2 && !r->is_recursive &&
-             r->head_arity == 1 &&
-             r->body_arities[0] == 2 && !r->body_negative[0] &&
-             r->body_arities[1] == 1 && r->body_negative[1]) {
-
-        for (Fact *f = c->facts; f; f = f->next) {
-            if (strcmp(f->predicate, r->body_preds[0]) == 0 && f->arity == 2) {
-                char *x = f->args[0];
-                char *y = f->args[1];
-                char *neg_args[1] = { y };
-                if (!fact_exists(c, r->body_preds[1], 1, neg_args)) {
-                    char *head_args[1] = { x };
-                    if (!fact_exists(c, r->head, 1, head_args)) {
-                        add_fact_direct(c, r->head, 1, head_args);
-                        added++;
-                    }
+                if (found_binding < 0) {
+                    head_valid = 0;
+                    break;
                 }
+                head_args[j] = binding_values[found_binding];
+            }
+            
+            if (head_valid && !fact_exists(c, r->head, r->head_arity, head_args)) {
+                add_fact_direct(c, r->head, r->head_arity, head_args);
+                added++;
             }
         }
+        
+        /* Increment indices */
+        int carry = 1;
+        for (int p = pos_count - 1; p >= 0 && carry; p--) {
+            indices[p]++;
+            if (indices[p] < pos_fact_counts[p]) {
+                carry = 0;
+            } else {
+                indices[p] = 0;
+            }
+        }
+        if (carry) break;
     }
-
+    
+    if (binding_values) free(binding_values);
+    free(indices);
+    for (int p = 0; p < pos_count; p++) {
+        if (pos_fact_lists[p]) free(pos_fact_lists[p]);
+    }
+    free(pos_fact_lists);
+    free(pos_fact_counts);
+    
     return added;
+}
+
+/* ====================================================================== */
+/* Dispatcher                                                              */
+/* ====================================================================== */
+
+static int apply_rule(Config *c, const Rule *r) {
+    /* Aggregate rules (special-case) */
+    if (r->aggregate_funcs && r->aggregate_funcs[0]) {
+        return apply_rule_aggregate(c, r);
+    }
+    
+    /* Arithmetic rules (special-case) */
+    if (r->arith_exprs) {
+        for (int i = 0; i < r->body_count; i++) {
+            if (r->arith_exprs[i]) {
+                return apply_rule_arithmetic(c, r, i);
+            }
+        }
+    }
+    
+    /* General n-way join for all other rules */
+    return apply_rule_general(c, r);
 }
 
 /* ====================================================================== */
@@ -565,9 +667,7 @@ static int rule_strat_fixed(const Rule *r, const ClosureIR *c) {
     int max_strat = 0;
     
     for (int i = 0; i < r->body_count; i++) {
-        /* Skip recursive body predicates */
         if (strcmp(r->body_preds[i], r->head) == 0) continue;
-        /* Skip arithmetic slots */
         if (strcmp(r->body_preds[i], "__arith__") == 0) continue;
         
         int body_strat = pred_strat_internal(r->body_preds[i], c);

@@ -69,7 +69,6 @@ static Expr *copy_expr(const Expr *e) {
     return NULL;
 }
 
-/* Helper: set head params on a node (takes ownership of strings) */
 static void node_set_head_params(Node *n, char **params, int param_count) {
     n->head_params = malloc(sizeof(char*) * param_count);
     n->head_param_count = param_count;
@@ -268,7 +267,28 @@ TranslationResult ast_to_graph_translate(const Program *program) {
             Node *observe_node = graph_add_node(result.graph, o->name, o->param_count, NODE_DERIVED);
             node_set_head_params(observe_node, o->params, o->param_count);
             
-            graph_add_edge(result.graph, observe_node, impl_node, EDGE_DEFINED_BY_BASE);
+            /* Create observe -> impl edge WITH bindings (identity mapping) */
+            Edge *base_edge = calloc(1, sizeof(Edge));
+            base_edge->target = impl_node;
+            base_edge->type = EDGE_DEFINED_BY_BASE;
+            base_edge->aggregate_func = NULL;
+            base_edge->aggregate_field = -1;
+            base_edge->arith_expr = NULL;
+            base_edge->arith_result_var = NULL;
+            base_edge->atom_args = NULL;
+            base_edge->atom_arg_count = 0;
+            base_edge->next = NULL;
+            
+            /* Populate bindings: observe params = impl params at same index */
+            base_edge->var_bindings = malloc(sizeof(EdgeVarBinding) * o->param_count);
+            base_edge->var_binding_count = o->param_count;
+            for (int j = 0; j < o->param_count; j++) {
+                base_edge->var_bindings[j].var_name = strdup(o->params[j]);
+                base_edge->var_bindings[j].arg_index = j;
+            }
+            
+            append_edge(observe_node, base_edge);
+            result.graph->edge_count++;
             
             add_condition_edges(result.graph, impl_name, &o->condition,
                                &base_relations, &derived_predicates);
