@@ -1,0 +1,16 @@
+# Test 6: Negative cycle (should be rejected by validator)
+# This creates a paradox: A is true if B is false, B is true if A is false
+
+entity Person
+
+derive honest(p)
+  from Person(p), not dishonest(p)
+
+derive dishonest(p)
+  from Person(p), not honest(p)
+
+input {
+  Person(Alice)
+}
+
+query honest(Alice)

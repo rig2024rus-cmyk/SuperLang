@@ -1,0 +1,21 @@
+# Compiled objects
+*.o
+*.obj
+
+# Binary
+superlang
+
+# Editor backup files
+*~
+*.bak
+*.swp
+
+# Valgrind output
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary test outputs
+/tmp_test_*

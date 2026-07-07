@@ -1,0 +1,30 @@
+# Test 2: Symmetric transitive closure (connected components)
+# Direct edge implies connection in both directions
+# Connection is transitive
+
+entity Node
+relation Edge(Node, Node)
+
+# Base case 1: direct edge forward
+derive connected(x, y)
+  from Edge(x, y)
+
+# Base case 2: direct edge backward (symmetry)
+derive connected(x, y)
+  from Edge(y, x)
+
+# Recursive case: transitivity
+derive connected(x, y)
+  from connected(x, z), connected(z, y)
+
+input {
+  Edge(A, B)
+  Edge(B, C)
+  Edge(D, E)
+}
+
+query connected(A, B)
+query connected(A, C)
+query connected(C, A)
+query connected(A, D)
+query connected(D, E)

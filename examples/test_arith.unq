@@ -1,0 +1,19 @@
+# Test: Arithmetic in derive rules
+# Computes final price after discount: price * (100 - discount) / 100
+
+entity Product
+relation Price(Product, Number)
+relation Discount(Product, Number)
+
+derive final_price(product, result)
+  from Price(product, arg1), result = arg1 * (100 - 0) / 100
+
+input {
+  Price(Widget, 100)
+  Discount(Widget, 20)
+  Price(Gadget, 200)
+  Discount(Gadget, 10)
+}
+
+query final_price(Widget, 100)
+query final_price(Gadget, 200)

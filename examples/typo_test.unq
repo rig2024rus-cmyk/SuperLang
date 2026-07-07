@@ -1,0 +1,24 @@
+# This program contains INTENTIONAL errors to test the TypeChecker
+
+entity Task
+relation Dependency(Task, Task)
+relation Finished(Task)
+
+# Error 1: Typo in predicate name (should be 'blocked')
+observe ready(t)
+  where Task(t), not blockd(t)
+
+# Error 2: Safety violation: 'other' is used in negated atom
+#          but never bound by any positive atom
+derive broken_rule(t)
+  from not Finished(other)
+
+# Error 3: Arity mismatch: Task takes 1 arg, using 2
+derive wrong_arity(t)
+  from Task(a, b)
+
+input {
+  Task(TaskA)
+}
+
+query ready(TaskA)
