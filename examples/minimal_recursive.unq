@@ -1,0 +1,18 @@
+entity X
+relation P(X, X)
+
+derive d(a, b) from P(a, b)
+derive d(a, b) from P(a, c), d(c, b)
+
+input {
+  X(one)
+  X(two)
+  X(three)
+  P(one, two)
+  P(two, three)
+}
+
+query d(one, two)
+query d(one, three)
+query d(two, three)
+query d(three, one)

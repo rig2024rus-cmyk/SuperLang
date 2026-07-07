@@ -84,31 +84,43 @@ static void binding_table_mark_head(BindingTable *t, char **head_params, int hea
     }
 }
 
-/* Collect all edges of certain types into an array (preserves order) */
-static Edge **collect_body_edges(Node *n, int *out_count) {
-    int count = 0;
-    for (Edge *e = n->outgoing; e; e = e->next) {
-        if (e->type == EDGE_DEFINED_BY_BASE ||
-            e->type == EDGE_DEFINED_BY_RECURSIVE ||
-            e->type == EDGE_DEFINED_BY_COMPOSITION ||
-            e->type == EDGE_DEFINED_BY_NEGATION) {
-            count++;
-        }
+/* ====================================================================== */
+/* Helper: add rule to closure list                                        */
+/* ====================================================================== */
+
+static void add_rule_to_closure(ClosureIR *closure, Rule *r) {
+    if (!closure->rules) {
+        closure->rules = r;
+    } else {
+        Rule *last = closure->rules;
+        while (last->next) last = last->next;
+        last->next = r;
+    }
+    closure->rule_count++;
+}
+
+/* ====================================================================== */
+/* Helper: build ArgBindings for a single body edge                        */
+/* ====================================================================== */
+
+static void build_bindings_for_edge(Rule *r, Edge *e, Node *n) {
+    BindingTable bt;
+    binding_table_init(&bt);
+    
+    /* Add bindings from the single body edge */
+    for (int j = 0; j < e->var_binding_count; j++) {
+        const char *var = e->var_bindings[j].var_name;
+        int bidx = binding_table_find_or_create(&bt, var);
+        binding_table_add_location(&bt, bidx, 0, e->var_bindings[j].arg_index);
     }
     
-    Edge **edges = malloc(sizeof(Edge*) * count);
-    int i = 0;
-    for (Edge *e = n->outgoing; e; e = e->next) {
-        if (e->type == EDGE_DEFINED_BY_BASE ||
-            e->type == EDGE_DEFINED_BY_RECURSIVE ||
-            e->type == EDGE_DEFINED_BY_COMPOSITION ||
-            e->type == EDGE_DEFINED_BY_NEGATION) {
-            edges[i++] = e;
-        }
+    /* Mark head params */
+    if (n->head_params && n->head_param_count > 0) {
+        binding_table_mark_head(&bt, n->head_params, n->head_param_count);
     }
     
-    *out_count = count;
-    return edges;
+    r->arg_bindings = bt.bindings;
+    r->arg_binding_count = bt.count;
 }
 
 /* ====================================================================== */
@@ -217,7 +229,52 @@ ClosureIR *synthesize(const Graph *g) {
     for (Node *n = g->nodes; n; n = n->next) {
         if (n->type != NODE_DERIVED) continue;
         
-        /* Check for aggregate edge */
+        /* ============================================================ */
+        /* CASE 1: Node has BASE edges (observe/derive -> impl)         */
+        /* Create SEPARATE rule for each BASE edge                      */
+        /* ============================================================ */
+        int base_edge_count = 0;
+        for (Edge *e = n->outgoing; e; e = e->next) {
+            if (e->type == EDGE_DEFINED_BY_BASE) {
+                base_edge_count++;
+            }
+        }
+        
+        if (base_edge_count > 0) {
+            /* Create one rule per BASE edge */
+            for (Edge *e = n->outgoing; e; e = e->next) {
+                if (e->type != EDGE_DEFINED_BY_BASE) continue;
+                
+                Rule *r = calloc(1, sizeof(Rule));
+                r->head = strdup(n->name);
+                r->head_arity = n->arity;
+                r->body_count = 1;
+                r->body_preds = malloc(sizeof(char*));
+                r->body_arities = malloc(sizeof(int));
+                r->body_negative = malloc(sizeof(int));
+                r->aggregate_funcs = NULL;
+                r->aggregate_fields = NULL;
+                r->arith_exprs = NULL;
+                r->arith_result_vars = NULL;
+                r->arg_bindings = NULL;
+                r->arg_binding_count = 0;
+                
+                r->body_preds[0] = strdup(e->target->name);
+                r->body_arities[0] = e->target->arity;
+                r->body_negative[0] = 0;
+                r->is_recursive = 0;
+                
+                /* Build ArgBindings for this single BASE edge */
+                build_bindings_for_edge(r, e, n);
+                
+                add_rule_to_closure(closure, r);
+            }
+            continue; /* Skip further processing for this node */
+        }
+        
+        /* ============================================================ */
+        /* CASE 2: Aggregate rule                                       */
+        /* ============================================================ */
         Edge *agg_edge = NULL;
         for (Edge *e = n->outgoing; e; e = e->next) {
             if (e->type == EDGE_DEFINED_BY_AGGREGATE) {
@@ -248,18 +305,13 @@ ClosureIR *synthesize(const Graph *g) {
             r->aggregate_fields[0] = agg_edge->aggregate_field;
             r->is_recursive = 0;
             
-            if (!closure->rules) {
-                closure->rules = r;
-            } else {
-                Rule *last = closure->rules;
-                while (last->next) last = last->next;
-                last->next = r;
-            }
-            closure->rule_count++;
+            add_rule_to_closure(closure, r);
             continue;
         }
         
-        /* Check for arithmetic edge */
+        /* ============================================================ */
+        /* CASE 3: Arithmetic rule                                      */
+        /* ============================================================ */
         Edge *arith_edge = NULL;
         for (Edge *e = n->outgoing; e; e = e->next) {
             if (e->type == EDGE_DEFINED_BY_ARITHMETIC) {
@@ -336,29 +388,28 @@ ClosureIR *synthesize(const Graph *g) {
                 binding_table_mark_head(&bt, n->head_params, n->head_param_count);
             }
             
-            /* Transfer to rule */
             r->arg_bindings = bt.bindings;
             r->arg_binding_count = bt.count;
             
-            if (!closure->rules) {
-                closure->rules = r;
-            } else {
-                Rule *last = closure->rules;
-                while (last->next) last = last->next;
-                last->next = r;
-            }
-            closure->rule_count++;
+            add_rule_to_closure(closure, r);
             continue;
         }
         
-        /* Non-aggregate, non-arithmetic rule — build with full ArgBindings */
+        /* ============================================================ */
+        /* CASE 4: General rule (composition, negation, recursion)      */
+        /* Build single rule with all non-special edges                 */
+        /* ============================================================ */
         int body_count = 0;
-        Edge **body_edges = collect_body_edges(n, &body_count);
-        
-        if (body_count == 0) {
-            free(body_edges);
-            continue;
+        for (Edge *e = n->outgoing; e; e = e->next) {
+            if (e->type == EDGE_DEFINED_BY_COMPOSITION ||
+                e->type == EDGE_DEFINED_BY_NEGATION ||
+                e->type == EDGE_DEFINED_BY_RECURSIVE ||
+                e->type == EDGE_DEFINED_BY_BASE) {
+                body_count++;
+            }
         }
+        
+        if (body_count == 0) continue;
         
         Rule *r = calloc(1, sizeof(Rule));
         r->head = strdup(n->name);
@@ -372,13 +423,20 @@ ClosureIR *synthesize(const Graph *g) {
         r->arith_exprs = NULL;
         r->arith_result_vars = NULL;
         
-        for (int i = 0; i < body_count; i++) {
-            Edge *e = body_edges[i];
-            r->body_preds[i] = strdup(e->target->name);
-            r->body_arities[i] = e->target->arity;
-            r->body_negative[i] = (e->type == EDGE_DEFINED_BY_NEGATION);
+        int i = 0;
+        for (Edge *e = n->outgoing; e; e = e->next) {
+            if (e->type == EDGE_DEFINED_BY_COMPOSITION ||
+                e->type == EDGE_DEFINED_BY_NEGATION ||
+                e->type == EDGE_DEFINED_BY_RECURSIVE ||
+                e->type == EDGE_DEFINED_BY_BASE) {
+                r->body_preds[i] = strdup(e->target->name);
+                r->body_arities[i] = e->target->arity;
+                r->body_negative[i] = (e->type == EDGE_DEFINED_BY_NEGATION);
+                i++;
+            }
         }
         
+        /* Detect recursion */
         r->is_recursive = 0;
         for (int k = 0; k < r->body_count; k++) {
             if (strcmp(r->body_preds[k], r->head) == 0) {
@@ -387,16 +445,22 @@ ClosureIR *synthesize(const Graph *g) {
             }
         }
         
-        /* Build ArgBindings from edges */
+        /* Build ArgBindings from all body edges */
         BindingTable bt;
         binding_table_init(&bt);
         
-        for (int i = 0; i < body_count; i++) {
-            Edge *e = body_edges[i];
-            for (int j = 0; j < e->var_binding_count; j++) {
-                const char *var = e->var_bindings[j].var_name;
-                int bidx = binding_table_find_or_create(&bt, var);
-                binding_table_add_location(&bt, bidx, i, e->var_bindings[j].arg_index);
+        int edge_idx = 0;
+        for (Edge *e = n->outgoing; e; e = e->next) {
+            if (e->type == EDGE_DEFINED_BY_COMPOSITION ||
+                e->type == EDGE_DEFINED_BY_NEGATION ||
+                e->type == EDGE_DEFINED_BY_RECURSIVE ||
+                e->type == EDGE_DEFINED_BY_BASE) {
+                for (int j = 0; j < e->var_binding_count; j++) {
+                    const char *var = e->var_bindings[j].var_name;
+                    int bidx = binding_table_find_or_create(&bt, var);
+                    binding_table_add_location(&bt, bidx, edge_idx, e->var_bindings[j].arg_index);
+                }
+                edge_idx++;
             }
         }
         
@@ -407,16 +471,7 @@ ClosureIR *synthesize(const Graph *g) {
         r->arg_bindings = bt.bindings;
         r->arg_binding_count = bt.count;
         
-        free(body_edges);
-        
-        if (!closure->rules) {
-            closure->rules = r;
-        } else {
-            Rule *last = closure->rules;
-            while (last->next) last = last->next;
-            last->next = r;
-        }
-        closure->rule_count++;
+        add_rule_to_closure(closure, r);
     }
     
     return closure;
