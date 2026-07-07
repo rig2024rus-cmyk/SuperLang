@@ -34,6 +34,10 @@ void graph_free(Graph *g) {
             e = next_e;
         }
         free(n->name);
+        for (int i = 0; i < n->head_param_count; i++) {
+            free(n->head_params[i]);
+        }
+        free(n->head_params);
         free(n);
         n = next_n;
     }
@@ -48,6 +52,8 @@ Node *graph_add_node(Graph *g, const char *name, int arity, NodeType type) {
     n->name = strdup(name);
     n->arity = arity;
     n->type = type;
+    n->head_params = NULL;
+    n->head_param_count = 0;
     n->outgoing = NULL;
     n->next = g->nodes;
     g->nodes = n;
@@ -112,7 +118,16 @@ void graph_dump(const Graph *g) {
     printf("Dependency Graph: %zu nodes, %zu edges\n",
            g->node_count, g->edge_count);
     for (Node *n = g->nodes; n; n = n->next) {
-        printf("  [%s] %s/%d\n", node_type_str(n->type), n->name, n->arity);
+        printf("  [%s] %s/%d", node_type_str(n->type), n->name, n->arity);
+        if (n->head_param_count > 0) {
+            printf(" (");
+            for (int i = 0; i < n->head_param_count; i++) {
+                if (i > 0) printf(", ");
+                printf("%s", n->head_params[i]);
+            }
+            printf(")");
+        }
+        printf("\n");
         for (Edge *e = n->outgoing; e; e = e->next) {
             if (e->type == EDGE_DEFINED_BY_AGGREGATE) {
                 printf("    --%s(%s, field_%d)--> %s\n",

@@ -20,7 +20,6 @@ typedef enum {
     EDGE_DEFINED_BY_ARITHMETIC
 } EdgeType;
 
-/* Variable binding information stored in edges */
 typedef struct {
     char *var_name;
     int arg_index;
@@ -34,11 +33,9 @@ typedef struct Edge {
     Expr *arith_expr;
     char *arith_result_var;
     
-    /* Variable bindings for this edge (which args are variables) */
     EdgeVarBinding *var_bindings;
     int var_binding_count;
     
-    /* Original atom args (for building Rule bindings) */
     char **atom_args;
     int atom_arg_count;
     
@@ -49,6 +46,11 @@ typedef struct Node {
     char *name;
     int arity;
     NodeType type;
+    
+    /* Head parameter names (only for derived/observation nodes) */
+    char **head_params;
+    int head_param_count;
+    
     Edge *outgoing;
     struct Node *next;
 } Node;
