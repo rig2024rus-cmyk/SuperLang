@@ -162,7 +162,7 @@ static double eval_expr(const Expr *e, const VarBindings *binds) {
 }
 
 /* ====================================================================== */
-/* Aggregate rules (special-case, unchanged)                              */
+/* Aggregate rules                                                        */
 /* ====================================================================== */
 
 static int apply_rule_aggregate(Config *c, const Rule *r) {
@@ -172,6 +172,8 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
     int src_arity = r->body_arities[0];
     int dst_arity = r->head_arity;
     
+    int needs_numeric = (strcmp(agg_func, "count") != 0);
+    
     typedef struct {
         char **key;
         int key_count;
@@ -179,6 +181,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
         int count;
         double min;
         double max;
+        int initialized;
     } Group;
     
     Group *groups = NULL;
@@ -198,11 +201,14 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
             }
         }
         
-        char *endptr;
-        double value = strtod(f->args[agg_field], &endptr);
-        if (*endptr != '\0') {
-            free(key);
-            continue;
+        double value = 0.0;
+        if (needs_numeric) {
+            char *endptr;
+            value = strtod(f->args[agg_field], &endptr);
+            if (*endptr != '\0') {
+                free(key);
+                continue;
+            }
         }
         
         Group *g = NULL;
@@ -231,14 +237,25 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
             g->key_count = key_count;
             g->sum = 0;
             g->count = 0;
-            g->min = value;
-            g->max = value;
+            g->min = 0;
+            g->max = 0;
+            g->initialized = 0;
         }
         
-        g->sum += value;
-        g->count++;
-        if (value < g->min) g->min = value;
-        if (value > g->max) g->max = value;
+        if (strcmp(agg_func, "count") == 0) {
+            g->count++;
+        } else {
+            g->sum += value;
+            g->count++;
+            if (!g->initialized) {
+                g->min = value;
+                g->max = value;
+                g->initialized = 1;
+            } else {
+                if (value < g->min) g->min = value;
+                if (value > g->max) g->max = value;
+            }
+        }
     }
     
     for (int i = 0; i < group_count; i++) {
@@ -246,8 +263,8 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
         double result;
         if (strcmp(agg_func, "sum") == 0) result = g->sum;
         else if (strcmp(agg_func, "count") == 0) result = g->count;
-        else if (strcmp(agg_func, "min") == 0) result = g->min;
-        else if (strcmp(agg_func, "max") == 0) result = g->max;
+        else if (strcmp(agg_func, "min") == 0) result = g->initialized ? g->min : 0;
+        else if (strcmp(agg_func, "max") == 0) result = g->initialized ? g->max : 0;
         else { free(g->key); continue; }
         
         char **args = malloc(sizeof(char*) * dst_arity);
@@ -261,14 +278,14 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
         } else {
             snprintf(buf, sizeof(buf), "%.2f", result);
         }
-        args[ai] = strdup(buf);
+        args[ai] = buf;  /* NO strdup: add_fact_direct will strdup internally */
         
         if (!fact_exists(c, r->head, dst_arity, args)) {
             add_fact_direct(c, r->head, dst_arity, args);
             added++;
-        } else {
-            free(args[ai]);
         }
+        /* No free needed: buf is stack-allocated, add_fact_direct made its copy */
+        
         free(args);
         free(g->key);
     }
@@ -278,13 +295,12 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
 }
 
 /* ====================================================================== */
-/* Arithmetic rules (special-case, unchanged)                             */
+/* Arithmetic rules                                                       */
 /* ====================================================================== */
 
 static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
     int added = 0;
     
-    /* Find all regular (non-arithmetic) body atoms */
     int regular_slots[16];
     int regular_count = 0;
     for (int i = 0; i < r->body_count && regular_count < 16; i++) {
@@ -295,7 +311,6 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
     
     if (regular_count == 0) return added;
     
-    /* Collect matching facts for each regular body atom */
     Fact **fact_lists[16];
     int fact_counts[16];
     
@@ -317,7 +332,12 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
         }
     }
     
-    /* Iterate through all combinations (cross product) */
+    int atom_to_pos[32];
+    for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
+    for (int s = 0; s < regular_count; s++) {
+        atom_to_pos[regular_slots[s]] = s;
+    }
+    
     int indices[16] = {0};
     
     while (1) {
@@ -331,71 +351,116 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
         if (!valid) break;
         
         Fact *current_facts[16];
-        int total_args = 0;
         for (int s = 0; s < regular_count; s++) {
             current_facts[s] = fact_lists[s][indices[s]];
-            total_args += current_facts[s]->arity;
         }
         
-        /* Build variable bindings: args become "arg0", "arg1", ... */
-        char **bind_names = malloc(sizeof(char*) * total_args);
-        const char **bind_values = malloc(sizeof(const char*) * total_args);
-        int bind_count = 0;
-        char name_bufs[64][32];
+        int combination_valid = 1;
+        char **binding_values = r->arg_binding_count > 0
+            ? malloc(sizeof(char*) * r->arg_binding_count)
+            : NULL;
         
-        for (int s = 0; s < regular_count; s++) {
-            Fact *f = current_facts[s];
-            for (int a = 0; a < f->arity; a++) {
-                snprintf(name_bufs[bind_count], 32, "arg%d", bind_count);
-                bind_names[bind_count] = strdup(name_bufs[bind_count]);
-                bind_values[bind_count] = f->args[a];
+        for (int b = 0; b < r->arg_binding_count && combination_valid; b++) {
+            ArgBinding *bind = &r->arg_bindings[b];
+            
+            if (bind->location_count == 0) {
+                binding_values[b] = NULL;
+                continue;
+            }
+            
+            ArgLocation *first = &bind->locations[0];
+            int pos = atom_to_pos[first->atom_index];
+            if (pos < 0) {
+                combination_valid = 0;
+                break;
+            }
+            char *value = current_facts[pos]->args[first->arg_index];
+            binding_values[b] = value;
+            
+            for (int l = 1; l < bind->location_count; l++) {
+                int p = atom_to_pos[bind->locations[l].atom_index];
+                if (p < 0) { combination_valid = 0; break; }
+                char *other = current_facts[p]->args[bind->locations[l].arg_index];
+                if (strcmp(value, other) != 0) {
+                    combination_valid = 0;
+                    break;
+                }
+            }
+        }
+        
+        if (combination_valid) {
+            const char **bind_names = malloc(sizeof(const char*) * r->arg_binding_count);
+            const char **bind_values_arr = malloc(sizeof(const char*) * r->arg_binding_count);
+            int bind_count = 0;
+            
+            for (int b = 0; b < r->arg_binding_count; b++) {
+                if (binding_values[b] == NULL) continue;
+                bind_names[bind_count] = r->arg_bindings[b].var_name;
+                bind_values_arr[bind_count] = binding_values[b];
                 bind_count++;
             }
-        }
-        
-        VarBindings binds;
-        binds.names = (const char**)bind_names;
-        binds.values = bind_values;
-        binds.count = bind_count;
-        
-        double val = eval_expr(r->arith_exprs[arith_slot], &binds);
-        
-        /* Build head args */
-        char **result_args = malloc(sizeof(char*) * r->head_arity);
-        int filled = 0;
-        
-        for (int s = 0; s < regular_count && filled < r->head_arity - 1; s++) {
-            Fact *f = current_facts[s];
-            for (int a = 0; a < f->arity && filled < r->head_arity - 1; a++) {
-                result_args[filled++] = f->args[a];
+            
+            VarBindings vbinds;
+            vbinds.names = bind_names;
+            vbinds.values = bind_values_arr;
+            vbinds.count = bind_count;
+            
+            double val = eval_expr(r->arith_exprs[arith_slot], &vbinds);
+            
+            char **result_args = malloc(sizeof(char*) * r->head_arity);
+            int head_valid = 1;
+            
+            for (int j = 0; j < r->head_arity; j++) {
+                int found = -1;
+                for (int b = 0; b < r->arg_binding_count; b++) {
+                    if (r->arg_bindings[b].is_head &&
+                        r->arg_bindings[b].head_arg_index == j) {
+                        found = b;
+                        break;
+                    }
+                }
+                if (found < 0 || binding_values[found] == NULL) {
+                    if (j == r->head_arity - 1) {
+                        char buf[64];
+                        if (val == (int)val && fabs(val) < 1e15) {
+                            snprintf(buf, sizeof(buf), "%d", (int)val);
+                        } else {
+                            snprintf(buf, sizeof(buf), "%.2f", val);
+                        }
+                        result_args[j] = strdup(buf);
+                    } else {
+                        head_valid = 0;
+                        break;
+                    }
+                } else {
+                    result_args[j] = binding_values[found];
+                }
             }
+            
+            if (head_valid && !fact_exists(c, r->head, r->head_arity, result_args)) {
+                char **final_args = malloc(sizeof(char*) * r->head_arity);
+                for (int j = 0; j < r->head_arity; j++) {
+                    final_args[j] = strdup(result_args[j]);
+                }
+                add_fact_direct(c, r->head, r->head_arity, final_args);
+                added++;
+                for (int j = 0; j < r->head_arity; j++) free(final_args[j]);
+                free(final_args);
+            }
+            
+            for (int j = 0; j < r->head_arity; j++) {
+                if (j == r->head_arity - 1) {
+                    free(result_args[j]);
+                }
+            }
+            free(result_args);
+            
+            free(bind_names);
+            free(bind_values_arr);
         }
         
-        while (filled < r->head_arity - 1) {
-            result_args[filled++] = "";
-        }
+        if (binding_values) free(binding_values);
         
-        char buf[64];
-        if (val == (int)val && fabs(val) < 1e15) {
-            snprintf(buf, sizeof(buf), "%d", (int)val);
-        } else {
-            snprintf(buf, sizeof(buf), "%.2f", val);
-        }
-        result_args[r->head_arity - 1] = strdup(buf);
-        
-        if (!fact_exists(c, r->head, r->head_arity, result_args)) {
-            add_fact_direct(c, r->head, r->head_arity, result_args);
-            added++;
-        }
-        
-        free(result_args[r->head_arity - 1]);
-        free(result_args);
-        
-        for (int i = 0; i < bind_count; i++) free(bind_names[i]);
-        free(bind_names);
-        free(bind_values);
-        
-        /* Increment indices (odometer) */
         int carry = 1;
         for (int s = regular_count - 1; s >= 0 && carry; s--) {
             indices[s]++;
@@ -416,13 +481,12 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
 }
 
 /* ====================================================================== */
-/* GENERAL N-WAY JOIN — replaces all hardcoded patterns                   */
+/* GENERAL N-WAY JOIN                                                     */
 /* ====================================================================== */
 
 static int apply_rule_general(Config *c, const Rule *r) {
     if (r->body_count == 0) return 0;
     
-    /* Step 1: Separate positive and negative body atoms */
     int pos_indices[32], neg_indices[32];
     int pos_count = 0, neg_count = 0;
     
@@ -436,7 +500,6 @@ static int apply_rule_general(Config *c, const Rule *r) {
     
     if (pos_count == 0) return 0;
     
-    /* Step 2: Collect matching facts for each positive atom */
     Fact ***pos_fact_lists = malloc(sizeof(Fact**) * pos_count);
     int *pos_fact_counts = calloc(pos_count, sizeof(int));
     
@@ -472,14 +535,12 @@ static int apply_rule_general(Config *c, const Rule *r) {
         }
     }
     
-    /* Step 3: Create mapping from global atom_idx to positive position */
     int atom_to_pos[32];
     for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
     for (int p = 0; p < pos_count; p++) {
         atom_to_pos[pos_indices[p]] = p;
     }
     
-    /* Step 4: Iterate through all combinations */
     int *indices = calloc(pos_count, sizeof(int));
     int added = 0;
     
@@ -502,13 +563,11 @@ static int apply_rule_general(Config *c, const Rule *r) {
             current_facts[p] = pos_fact_lists[p][indices[p]];
         }
         
-        /* Step 5: Build bindings — only from POSITIVE atoms */
         int combination_valid = 1;
         
         for (int b = 0; b < r->arg_binding_count; b++) {
             ArgBinding *bind = &r->arg_bindings[b];
             
-            /* Find first location in a positive atom */
             int first_pos_loc = -1;
             for (int l = 0; l < bind->location_count; l++) {
                 int atom_idx = bind->locations[l].atom_index;
@@ -519,7 +578,6 @@ static int apply_rule_general(Config *c, const Rule *r) {
             }
             
             if (first_pos_loc < 0) {
-                /* Variable not bound by any positive atom — should not happen */
                 combination_valid = 0;
                 break;
             }
@@ -529,13 +587,12 @@ static int apply_rule_general(Config *c, const Rule *r) {
             char *value = current_facts[pos_idx]->args[first->arg_index];
             binding_values[b] = value;
             
-            /* Check unification with other POSITIVE atom locations */
             for (int l = 0; l < bind->location_count; l++) {
                 if (l == first_pos_loc) continue;
                 
                 int atom_idx = bind->locations[l].atom_index;
                 int pos = atom_to_pos[atom_idx];
-                if (pos < 0) continue; /* Skip negative atoms */
+                if (pos < 0) continue;
                 
                 char *other = current_facts[pos]->args[bind->locations[l].arg_index];
                 if (strcmp(value, other) != 0) {
@@ -546,7 +603,6 @@ static int apply_rule_general(Config *c, const Rule *r) {
             if (!combination_valid) break;
         }
         
-        /* Step 6: Check negative atoms */
         if (combination_valid) {
             for (int n = 0; n < neg_count && combination_valid; n++) {
                 int atom_idx = neg_indices[n];
@@ -583,7 +639,6 @@ static int apply_rule_general(Config *c, const Rule *r) {
             }
         }
         
-        /* Step 7: Build head fact */
         if (combination_valid && r->head_arity > 0) {
             char *head_args[32];
             int head_valid = 1;
@@ -610,7 +665,6 @@ static int apply_rule_general(Config *c, const Rule *r) {
             }
         }
         
-        /* Increment indices */
         int carry = 1;
         for (int p = pos_count - 1; p >= 0 && carry; p--) {
             indices[p]++;
@@ -639,12 +693,10 @@ static int apply_rule_general(Config *c, const Rule *r) {
 /* ====================================================================== */
 
 static int apply_rule(Config *c, const Rule *r) {
-    /* Aggregate rules (special-case) */
     if (r->aggregate_funcs && r->aggregate_funcs[0]) {
         return apply_rule_aggregate(c, r);
     }
     
-    /* Arithmetic rules (special-case) */
     if (r->arith_exprs) {
         for (int i = 0; i < r->body_count; i++) {
             if (r->arith_exprs[i]) {
@@ -653,7 +705,6 @@ static int apply_rule(Config *c, const Rule *r) {
         }
     }
     
-    /* General n-way join for all other rules */
     return apply_rule_general(c, r);
 }
 
