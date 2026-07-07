@@ -69,6 +69,15 @@ static Expr *copy_expr(const Expr *e) {
     return NULL;
 }
 
+/* Helper: set head params on a node (takes ownership of strings) */
+static void node_set_head_params(Node *n, char **params, int param_count) {
+    n->head_params = malloc(sizeof(char*) * param_count);
+    n->head_param_count = param_count;
+    for (int i = 0; i < param_count; i++) {
+        n->head_params[i] = strdup(params[i]);
+    }
+}
+
 static void add_condition_edges(Graph *g, const char *head_name,
                                 const Condition *cond,
                                 StringSet *base_relations,
@@ -100,7 +109,6 @@ static void add_condition_edges(Graph *g, const char *head_name,
             e->arith_result_var = NULL;
             e->next = NULL;
             
-            /* Store variable bindings */
             e->var_bindings = malloc(sizeof(EdgeVarBinding) * atom->arg_count);
             e->var_binding_count = atom->arg_count;
             for (int j = 0; j < atom->arg_count; j++) {
@@ -108,7 +116,6 @@ static void add_condition_edges(Graph *g, const char *head_name,
                 e->var_bindings[j].arg_index = j;
             }
             
-            /* Store original atom args */
             e->atom_args = malloc(sizeof(char*) * atom->arg_count);
             e->atom_arg_count = atom->arg_count;
             for (int j = 0; j < atom->arg_count; j++) {
@@ -143,7 +150,6 @@ static void add_condition_edges(Graph *g, const char *head_name,
             e->arith_result_var = NULL;
             e->next = NULL;
             
-            /* Store variable bindings */
             e->var_bindings = malloc(sizeof(EdgeVarBinding) * atom->arg_count);
             e->var_binding_count = atom->arg_count;
             for (int j = 0; j < atom->arg_count; j++) {
@@ -151,7 +157,6 @@ static void add_condition_edges(Graph *g, const char *head_name,
                 e->var_bindings[j].arg_index = j;
             }
             
-            /* Store original atom args */
             e->atom_args = malloc(sizeof(char*) * atom->arg_count);
             e->atom_arg_count = atom->arg_count;
             for (int j = 0; j < atom->arg_count; j++) {
@@ -245,7 +250,8 @@ TranslationResult ast_to_graph_translate(const Program *program) {
     
     for (int i = 0; i < program->derive_count; i++) {
         const DeriveDecl *d = &program->derives[i];
-        graph_add_node(result.graph, d->name, d->param_count, NODE_DERIVED);
+        Node *n = graph_add_node(result.graph, d->name, d->param_count, NODE_DERIVED);
+        node_set_head_params(n, d->params, d->param_count);
         string_set_add(&derived_predicates, d->name);
     }
     
@@ -256,19 +262,22 @@ TranslationResult ast_to_graph_translate(const Program *program) {
             char impl_name[256];
             snprintf(impl_name, sizeof(impl_name), "%s_impl", o->name);
             
-            graph_add_node(result.graph, impl_name, o->param_count, NODE_DERIVED);
-            graph_add_node(result.graph, o->name, o->param_count, NODE_DERIVED);
+            Node *impl_node = graph_add_node(result.graph, impl_name, o->param_count, NODE_DERIVED);
+            node_set_head_params(impl_node, o->params, o->param_count);
             
-            Node *from = graph_find_node(result.graph, o->name);
-            Node *to = graph_find_node(result.graph, impl_name);
-            if (from && to) {
-                graph_add_edge(result.graph, from, to, EDGE_DEFINED_BY_BASE);
-            }
+            Node *observe_node = graph_add_node(result.graph, o->name, o->param_count, NODE_DERIVED);
+            node_set_head_params(observe_node, o->params, o->param_count);
+            
+            graph_add_edge(result.graph, observe_node, impl_node, EDGE_DEFINED_BY_BASE);
             
             add_condition_edges(result.graph, impl_name, &o->condition,
                                &base_relations, &derived_predicates);
+            string_set_add(&derived_predicates, o->name);
+            string_set_add(&derived_predicates, impl_name);
         } else {
-            graph_add_node(result.graph, o->name, o->param_count, NODE_DERIVED);
+            Node *n = graph_add_node(result.graph, o->name, o->param_count, NODE_DERIVED);
+            node_set_head_params(n, o->params, o->param_count);
+            string_set_add(&derived_predicates, o->name);
         }
     }
     
