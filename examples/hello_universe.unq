@@ -1,0 +1,24 @@
+# Hello, Universe — классическая первая программа
+# Показывает декларативную природу SuperLang:
+# мы описываем ЧТО значит "быть приветствуемым", а не КАК это проверить
+
+entity Being
+relation Greets(Being, Being)
+
+# Наблюдение: существо приветствуемо, если кто-то его приветствует
+observe welcomed(being)
+  where Being(being), Greets(greeter, being)
+
+input {
+  Being(Earth)
+  Being(Universe)
+  Being(Sun)
+  Greets(Universe, Earth)
+  Greets(Sun, Earth)
+  Greets(Earth, Universe)
+}
+
+# Кто приветствуем?
+query welcomed(Earth)      # TRUE (Universe и Sun приветствуют Earth)
+query welcomed(Universe)   # TRUE (Earth приветствует Universe)
+query welcomed(Sun)        # FALSE (никто не приветствует Sun)

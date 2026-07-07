@@ -1,0 +1,42 @@
+# Космический калькулятор: считаем суммарную энергию звёздных систем
+# Комбинация отношений + агрегатов + арифметики
+
+entity Star
+entity Planet
+relation Orbits(Planet, Star)
+relation Energy(Star, Number)
+
+# Шаг 1: Декларативно определяем "звёздные системы" (планеты, орбитирующие звезду)
+derive system_star(planet, star)
+  from Orbits(planet, star)
+
+# Шаг 2: Энергия системы = энергия звезды * количество планет (агрегат)
+derive system_energy(star, total)
+  from sum(Orbits(planet, star), planet) as total_planets
+
+# Шаг 3: Применяем арифметику: итоговая энергия = энергия_звезды * число_планет
+derive final_energy(star, result)
+  from Energy(star, arg1), system_energy(star, arg2), result = arg1 * arg2
+
+input {
+  Star(Sol)
+  Star(Alpha_Centauri)
+  Planet(Earth)
+  Planet(Mars)
+  Planet(Venus)
+  Planet(Proxima_b)
+  Orbits(Earth, Sol)
+  Orbits(Mars, Sol)
+  Orbits(Venus, Sol)
+  Orbits(Proxima_b, Alpha_Centauri)
+  Energy(Sol, 100)
+  Energy(Alpha_Centauri, 150)
+}
+
+# Сколько планет у каждой звезды?
+query system_energy(Sol, 3)            # TRUE (3 планеты)
+query system_energy(Alpha_Centauri, 1) # TRUE (1 планета)
+
+# Финальная энергия системы?
+query final_energy(Sol, 300)            # TRUE (100 * 3)
+query final_energy(Alpha_Centauri, 150) # TRUE (150 * 1)

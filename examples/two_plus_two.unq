@@ -1,0 +1,25 @@
+# Простая арифметика на SuperLang
+# Позиционное связывание: arg0, arg1, ... — аргументы body-атомов по порядку
+
+entity Unit
+relation Exists(Unit)
+
+# 1 + 1 = 2
+derive two(unit, result)
+  from Exists(unit), result = 1 + 1
+
+# 2 + 2 = 4
+derive four(unit, result)
+  from Exists(unit), result = 2 + 2
+
+# Более сложное: (2 + 2) * 2 = 8
+derive eight(unit, result)
+  from Exists(unit), result = (2 + 2) * 2
+
+input {
+  Exists(one)
+}
+
+query two(one, 2)
+query four(one, 4)
+query eight(one, 8)
