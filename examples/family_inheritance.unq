@@ -1,0 +1,86 @@
+# Family Inheritance Calculation
+# Декларативная спецификация родственных отношений и наследственного права
+
+entity Person
+relation Parent(Person, Person)
+relation Estate(Person, Number)
+relation Deceased(Person)
+
+# Базовое родство: grandparent через 2 Parent-связки
+derive grandparent(gp, gc)
+  from Parent(gp, mid), Parent(mid, gc)
+
+# Транзитивное замыкание: descendant через любое число поколений
+derive descendant(anc, dsc)
+  from Parent(anc, dsc)
+
+derive descendant(anc, dsc)
+  from Parent(anc, mid), descendant(mid, dsc)
+
+# Количество внуков у человека
+derive grandchild_count(gp, cnt)
+  from cnt = count(grandparent(gp, gc), gc)
+
+# Количество всех потомков
+derive descendant_count(anc, cnt)
+  from cnt = count(descendant(anc, dsc), dsc)
+
+# Наследство для каждого внука = Estate / количество_внуков
+derive grandchild_share(gp, gc, share)
+  from Estate(gp, arg0), grandchild_count(gp, arg1), grandparent(gp, gc),
+       share = arg0 / arg1
+
+input {
+  Person(Grandpa_Ivan)
+  Person(Grandma_Maria)
+  Person(Father_Peter)
+  Person(Uncle_Vasiliy)
+  Person(Aunt_Olga)
+  Person(Son_Alexey)
+  Person(Daughter_Natasha)
+  Person(Cousin_Dmitry)
+  Person(Cousin_Elena)
+  
+  Parent(Grandpa_Ivan, Father_Peter)
+  Parent(Grandma_Maria, Father_Peter)
+  Parent(Grandpa_Ivan, Uncle_Vasiliy)
+  Parent(Grandma_Maria, Uncle_Vasiliy)
+  Parent(Grandpa_Ivan, Aunt_Olga)
+  Parent(Grandma_Maria, Aunt_Olga)
+  
+  Parent(Father_Peter, Son_Alexey)
+  Parent(Father_Peter, Daughter_Natasha)
+  Parent(Uncle_Vasiliy, Cousin_Dmitry)
+  Parent(Uncle_Vasiliy, Cousin_Elena)
+  
+  Estate(Grandpa_Ivan, 100000)
+  Estate(Grandma_Maria, 80000)
+  
+  Deceased(Grandpa_Ivan)
+  Deceased(Grandma_Maria)
+}
+
+# Родственные отношения
+query grandparent(Grandpa_Ivan, Son_Alexey)
+query grandparent(Grandma_Maria, Cousin_Elena)
+query grandparent(Father_Peter, Cousin_Dmitry)
+
+query descendant(Grandpa_Ivan, Son_Alexey)
+query descendant(Grandpa_Ivan, Cousin_Elena)
+query descendant(Father_Peter, Cousin_Dmitry)
+
+# Количество
+query grandchild_count(Grandpa_Ivan, 4)
+query grandchild_count(Grandma_Maria, 4)
+query grandchild_count(Father_Peter, 0)
+query descendant_count(Grandpa_Ivan, 7)
+
+# Наследство: 100000 / 4 = 25000 каждому внуку от дедушки
+query grandchild_share(Grandpa_Ivan, Son_Alexey, 25000)
+query grandchild_share(Grandpa_Ivan, Cousin_Elena, 25000)
+query grandchild_share(Grandpa_Ivan, Daughter_Natasha, 25000)
+query grandchild_share(Grandpa_Ivan, Cousin_Dmitry, 25000)
+
+# 80000 / 4 = 20000 каждому от бабушки
+query grandchild_share(Grandma_Maria, Son_Alexey, 20000)
+query grandchild_share(Grandma_Maria, Cousin_Elena, 20000)

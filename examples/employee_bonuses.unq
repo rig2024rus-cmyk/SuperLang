@@ -1,0 +1,91 @@
+# Employee Bonus Calculation
+# Декларативная спецификация бизнес-логики расчёта квартальных бонусов
+
+entity Employee
+entity Department
+entity Quarter
+
+relation WorksIn(Employee, Department)
+relation ReportsTo(Employee, Employee)
+relation SalesAmount(Employee, Quarter, Number)
+relation DepartmentTarget(Department, Number)
+
+# ШАГ 1: Проекция — убираем Quarter
+derive sales_for_emp(emp, amount)
+  from SalesAmount(emp, q, amount)
+
+# ШАГ 2: Суммарные продажи (группировка только по emp)
+derive total_sales(emp, total)
+  from total = sum(sales_for_emp(emp, amount), amount)
+
+# ШАГ 3: Базовый бонус = total_sales * 5%
+derive base_bonus(emp, bonus)
+  from total_sales(emp, arg0), bonus = arg0 * 5 / 100
+
+# ШАГ 4: Количество подчинённых (cnt, не count — keyword)
+derive team_size(manager, cnt)
+  from cnt = count(ReportsTo(employee, manager), employee)
+
+# ШАГ 5: Бонус менеджера = 5% от продаж + 50 за каждого подчинённого
+derive manager_bonus(manager, total_bonus)
+  from total_sales(manager, arg0), team_size(manager, arg1),
+       total_bonus = arg0 * 5 / 100 + arg1 * 50
+
+input {
+  Employee(Alice_Smith)
+  Employee(Bob_Jones)
+  Employee(Charlie_Brown)
+  Employee(Diana_Prince)
+  Employee(Eve_Williams)
+  
+  Department(Sales_Department)
+  Department(Engineering_Department)
+  Quarter(Q1_2026)
+  Quarter(Q2_2026)
+  
+  WorksIn(Alice_Smith, Sales_Department)
+  WorksIn(Bob_Jones, Sales_Department)
+  WorksIn(Charlie_Brown, Sales_Department)
+  WorksIn(Diana_Prince, Engineering_Department)
+  WorksIn(Eve_Williams, Engineering_Department)
+  
+  ReportsTo(Bob_Jones, Alice_Smith)
+  ReportsTo(Charlie_Brown, Alice_Smith)
+  ReportsTo(Eve_Williams, Diana_Prince)
+  
+  SalesAmount(Alice_Smith, Q1_2026, 5000)
+  SalesAmount(Alice_Smith, Q2_2026, 7000)
+  SalesAmount(Bob_Jones, Q1_2026, 3000)
+  SalesAmount(Bob_Jones, Q2_2026, 4500)
+  SalesAmount(Charlie_Brown, Q1_2026, 2500)
+  SalesAmount(Charlie_Brown, Q2_2026, 3500)
+  SalesAmount(Diana_Prince, Q1_2026, 8000)
+  SalesAmount(Diana_Prince, Q2_2026, 9500)
+  SalesAmount(Eve_Williams, Q1_2026, 1500)
+  SalesAmount(Eve_Williams, Q2_2026, 2000)
+  
+  DepartmentTarget(Sales_Department, 20000)
+  DepartmentTarget(Engineering_Department, 30000)
+}
+
+# Проверки total_sales
+query total_sales(Alice_Smith, 12000)
+query total_sales(Bob_Jones, 7500)
+query total_sales(Diana_Prince, 17500)
+query total_sales(Eve_Williams, 3500)
+query total_sales(Charlie_Brown, 6000)
+
+# team_size
+query team_size(Alice_Smith, 2)
+query team_size(Diana_Prince, 1)
+query team_size(Bob_Jones, 0)
+
+# base_bonus
+query base_bonus(Alice_Smith, 600)
+query base_bonus(Bob_Jones, 375)
+query base_bonus(Diana_Prince, 875)
+
+# manager_bonus
+query manager_bonus(Alice_Smith, 700)
+query manager_bonus(Diana_Prince, 925)
+query manager_bonus(Bob_Jones, 375)

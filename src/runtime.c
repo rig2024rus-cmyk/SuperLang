@@ -115,10 +115,6 @@ void config_dump(const Config *c) {
     }
 }
 
-/* ====================================================================== */
-/* Expression evaluator (for arithmetic rules)                            */
-/* ====================================================================== */
-
 typedef struct {
     const char **names;
     const char **values;
@@ -160,10 +156,6 @@ static double eval_expr(const Expr *e, const VarBindings *binds) {
     }
     return 0.0;
 }
-
-/* ====================================================================== */
-/* Aggregate rules                                                        */
-/* ====================================================================== */
 
 static int apply_rule_aggregate(Config *c, const Rule *r) {
     int added = 0;
@@ -278,13 +270,12 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
         } else {
             snprintf(buf, sizeof(buf), "%.2f", result);
         }
-        args[ai] = buf;  /* NO strdup: add_fact_direct will strdup internally */
+        args[ai] = buf;
         
         if (!fact_exists(c, r->head, dst_arity, args)) {
             add_fact_direct(c, r->head, dst_arity, args);
             added++;
         }
-        /* No free needed: buf is stack-allocated, add_fact_direct made its copy */
         
         free(args);
         free(g->key);
@@ -293,10 +284,6 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
     
     return added;
 }
-
-/* ====================================================================== */
-/* Arithmetic rules                                                       */
-/* ====================================================================== */
 
 static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
     int added = 0;
@@ -479,10 +466,6 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
     
     return added;
 }
-
-/* ====================================================================== */
-/* GENERAL N-WAY JOIN                                                     */
-/* ====================================================================== */
 
 static int apply_rule_general(Config *c, const Rule *r) {
     if (r->body_count == 0) return 0;
@@ -688,10 +671,6 @@ static int apply_rule_general(Config *c, const Rule *r) {
     return added;
 }
 
-/* ====================================================================== */
-/* Dispatcher                                                              */
-/* ====================================================================== */
-
 static int apply_rule(Config *c, const Rule *r) {
     if (r->aggregate_funcs && r->aggregate_funcs[0]) {
         return apply_rule_aggregate(c, r);
@@ -709,19 +688,21 @@ static int apply_rule(Config *c, const Rule *r) {
 }
 
 /* ====================================================================== */
-/* Stratification                                                          */
+/* Stratification с excluded_head для предотвращения бесконечной рекурсии */
 /* ====================================================================== */
 
-static int pred_strat_internal(const char *pred, const ClosureIR *c);
+static int pred_strat_internal(const char *pred, const ClosureIR *c, const char *excluded_head);
 
-static int rule_strat_fixed(const Rule *r, const ClosureIR *c) {
+static int rule_strat_fixed(const Rule *r, const ClosureIR *c, const char *excluded_head) {
     int max_strat = 0;
     
     for (int i = 0; i < r->body_count; i++) {
+        /* Skip direct self-reference */
         if (strcmp(r->body_preds[i], r->head) == 0) continue;
+        /* Skip arithmetic pseudo-atoms */
         if (strcmp(r->body_preds[i], "__arith__") == 0) continue;
         
-        int body_strat = pred_strat_internal(r->body_preds[i], c);
+        int body_strat = pred_strat_internal(r->body_preds[i], c, excluded_head);
         int required = r->body_negative[i] ? (body_strat + 1) : body_strat;
         if (required > max_strat) max_strat = required;
     }
@@ -729,7 +710,15 @@ static int rule_strat_fixed(const Rule *r, const ClosureIR *c) {
     return max_strat;
 }
 
-static int pred_strat_internal(const char *pred, const ClosureIR *c) {
+static int pred_strat_internal(const char *pred, const ClosureIR *c, const char *excluded_head) {
+    /* CRITICAL: Prevent infinite recursion through intermediate impl nodes.
+     * If pred == excluded_head (the original head we're computing strat for),
+     * return 0 — recursive body atoms live in the same stratum as the head.
+     */
+    if (excluded_head && strcmp(pred, excluded_head) == 0) {
+        return 0;
+    }
+    
     int is_base = 1;
     for (Rule *r = c->rules; r; r = r->next) {
         if (strcmp(r->head, pred) == 0) {
@@ -742,7 +731,7 @@ static int pred_strat_internal(const char *pred, const ClosureIR *c) {
     int max_strat = 0;
     for (Rule *r = c->rules; r; r = r->next) {
         if (strcmp(r->head, pred) == 0) {
-            int r_strat = rule_strat_fixed(r, c);
+            int r_strat = rule_strat_fixed(r, c, excluded_head);
             if (r_strat > max_strat) max_strat = r_strat;
         }
     }
@@ -756,7 +745,7 @@ void saturate(Config *c, const ClosureIR *closure) {
     int max_strat = 0;
     int i = 0;
     for (Rule *r = closure->rules; r; r = r->next) {
-        strats[i] = rule_strat_fixed(r, closure);
+        strats[i] = rule_strat_fixed(r, closure, r->head);
         if (strats[i] > max_strat) max_strat = strats[i];
         i++;
     }
