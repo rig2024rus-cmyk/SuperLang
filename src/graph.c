@@ -19,6 +19,17 @@ void graph_free(Graph *g) {
             if (e->aggregate_func) free(e->aggregate_func);
             if (e->arith_result_var) free(e->arith_result_var);
             if (e->arith_expr) expr_free(e->arith_expr);
+            
+            for (int i = 0; i < e->var_binding_count; i++) {
+                free(e->var_bindings[i].var_name);
+            }
+            free(e->var_bindings);
+            
+            for (int i = 0; i < e->atom_arg_count; i++) {
+                free(e->atom_args[i]);
+            }
+            free(e->atom_args);
+            
             free(e);
             e = next_e;
         }
@@ -52,6 +63,10 @@ void graph_add_edge(Graph *g, Node *from, Node *to, EdgeType type) {
     e->aggregate_field = -1;
     e->arith_expr = NULL;
     e->arith_result_var = NULL;
+    e->var_bindings = NULL;
+    e->var_binding_count = 0;
+    e->atom_args = NULL;
+    e->atom_arg_count = 0;
     e->next = NULL;
     
     if (!from->outgoing) {
@@ -108,7 +123,16 @@ void graph_dump(const Graph *g) {
                        edge_type_str(e->type), e->arith_result_var,
                        e->target->name);
             } else {
-                printf("    --%s--> %s\n", edge_type_str(e->type), e->target->name);
+                printf("    --%s--> %s", edge_type_str(e->type), e->target->name);
+                if (e->var_binding_count > 0) {
+                    printf(" [");
+                    for (int i = 0; i < e->var_binding_count; i++) {
+                        if (i > 0) printf(", ");
+                        printf("%s@%d", e->var_bindings[i].var_name, e->var_bindings[i].arg_index);
+                    }
+                    printf("]");
+                }
+                printf("\n");
             }
         }
     }

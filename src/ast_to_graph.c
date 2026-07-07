@@ -51,7 +51,6 @@ static void append_edge(Node *from, Edge *e) {
     }
 }
 
-/* Deep copy of expression tree */
 static Expr *copy_expr(const Expr *e) {
     if (!e) return NULL;
     switch (e->type) {
@@ -92,7 +91,32 @@ static void add_condition_edges(Graph *g, const char *head_name,
         Node *from = graph_find_node(g, head_name);
         Node *to = graph_find_node(g, atom->predicate);
         if (from && to) {
-            graph_add_edge(g, from, to, edge_type);
+            Edge *e = calloc(1, sizeof(Edge));
+            e->target = to;
+            e->type = edge_type;
+            e->aggregate_func = NULL;
+            e->aggregate_field = -1;
+            e->arith_expr = NULL;
+            e->arith_result_var = NULL;
+            e->next = NULL;
+            
+            /* Store variable bindings */
+            e->var_bindings = malloc(sizeof(EdgeVarBinding) * atom->arg_count);
+            e->var_binding_count = atom->arg_count;
+            for (int j = 0; j < atom->arg_count; j++) {
+                e->var_bindings[j].var_name = strdup(atom->args[j]);
+                e->var_bindings[j].arg_index = j;
+            }
+            
+            /* Store original atom args */
+            e->atom_args = malloc(sizeof(char*) * atom->arg_count);
+            e->atom_arg_count = atom->arg_count;
+            for (int j = 0; j < atom->arg_count; j++) {
+                e->atom_args[j] = strdup(atom->args[j]);
+            }
+            
+            append_edge(from, e);
+            g->edge_count++;
         }
     }
     
@@ -110,7 +134,32 @@ static void add_condition_edges(Graph *g, const char *head_name,
         Node *from = graph_find_node(g, head_name);
         Node *to = graph_find_node(g, atom->predicate);
         if (from && to) {
-            graph_add_edge(g, from, to, EDGE_DEFINED_BY_NEGATION);
+            Edge *e = calloc(1, sizeof(Edge));
+            e->target = to;
+            e->type = EDGE_DEFINED_BY_NEGATION;
+            e->aggregate_func = NULL;
+            e->aggregate_field = -1;
+            e->arith_expr = NULL;
+            e->arith_result_var = NULL;
+            e->next = NULL;
+            
+            /* Store variable bindings */
+            e->var_bindings = malloc(sizeof(EdgeVarBinding) * atom->arg_count);
+            e->var_binding_count = atom->arg_count;
+            for (int j = 0; j < atom->arg_count; j++) {
+                e->var_bindings[j].var_name = strdup(atom->args[j]);
+                e->var_bindings[j].arg_index = j;
+            }
+            
+            /* Store original atom args */
+            e->atom_args = malloc(sizeof(char*) * atom->arg_count);
+            e->atom_arg_count = atom->arg_count;
+            for (int j = 0; j < atom->arg_count; j++) {
+                e->atom_args[j] = strdup(atom->args[j]);
+            }
+            
+            append_edge(from, e);
+            g->edge_count++;
         }
     }
     
@@ -135,6 +184,10 @@ static void add_condition_edges(Graph *g, const char *head_name,
             e->aggregate_field = atom->aggregate_field;
             e->arith_expr = NULL;
             e->arith_result_var = NULL;
+            e->var_bindings = NULL;
+            e->var_binding_count = 0;
+            e->atom_args = NULL;
+            e->atom_arg_count = 0;
             e->next = NULL;
             append_edge(from, e);
             g->edge_count++;
@@ -149,12 +202,16 @@ static void add_condition_edges(Graph *g, const char *head_name,
         if (!from) continue;
         
         Edge *e = calloc(1, sizeof(Edge));
-        e->target = from;  /* self-edge (arithmetic doesn't depend on a specific predicate) */
+        e->target = from;
         e->type = EDGE_DEFINED_BY_ARITHMETIC;
         e->aggregate_func = NULL;
         e->aggregate_field = -1;
         e->arith_expr = copy_expr(a->expr);
         e->arith_result_var = strdup(a->result_var);
+        e->var_bindings = NULL;
+        e->var_binding_count = 0;
+        e->atom_args = NULL;
+        e->atom_arg_count = 0;
         e->next = NULL;
         append_edge(from, e);
         g->edge_count++;

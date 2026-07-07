@@ -12,10 +12,7 @@ typedef struct {
     int error_column;
 } TranslationResult;
 
-/* Translate AST program into Semantic Graph */
 TranslationResult ast_to_graph_translate(const Program *program);
-
-/* Free translation result (including the graph) */
 void translation_result_free(TranslationResult *result);
 
 #endif

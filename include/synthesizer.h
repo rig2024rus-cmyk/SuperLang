@@ -3,6 +3,21 @@
 
 #include "graph.h"
 
+/* Location of a variable in a body atom */
+typedef struct {
+    int atom_index;      // which body atom (0, 1, 2, ...)
+    int arg_index;       // which argument position in that atom
+} ArgLocation;
+
+/* Binding information for a variable */
+typedef struct {
+    char *var_name;                    // variable name (e.g., "being", "greeter")
+    ArgLocation *locations;            // all places where this variable appears
+    int location_count;
+    int is_head;                       // does this variable appear in the head?
+    int head_arg_index;                // if is_head, which position in head args
+} ArgBinding;
+
 typedef struct Rule {
     char *head;
     int head_arity;
@@ -14,9 +29,13 @@ typedef struct Rule {
     char **aggregate_funcs;
     int *aggregate_fields;
     
-    /* Arithmetic: expression and result variable name per body slot */
+    /* Arithmetic */
     Expr **arith_exprs;
     char **arith_result_vars;
+    
+    /* Variable bindings for general join */
+    ArgBinding *arg_bindings;
+    int arg_binding_count;
     
     struct Rule *next;
 } Rule;
