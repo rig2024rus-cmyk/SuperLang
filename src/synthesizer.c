@@ -42,14 +42,12 @@ static void binding_table_init(BindingTable *t) {
 }
 
 static int binding_table_find_or_create(BindingTable *t, const char *var_name) {
-    /* Look for existing binding */
     for (int i = 0; i < t->count; i++) {
         if (strcmp(t->bindings[i].var_name, var_name) == 0) {
             return i;
         }
     }
     
-    /* Create new binding */
     if (t->count >= t->capacity) {
         t->capacity = t->capacity == 0 ? 8 : t->capacity * 2;
         t->bindings = realloc(t->bindings, sizeof(ArgBinding) * t->capacity);
@@ -86,20 +84,8 @@ static void binding_table_mark_head(BindingTable *t, char **head_params, int hea
     }
 }
 
-static void binding_table_free(BindingTable *t) {
-    for (int i = 0; i < t->count; i++) {
-        free(t->bindings[i].var_name);
-        free(t->bindings[i].locations);
-    }
-    free(t->bindings);
-    t->bindings = NULL;
-    t->count = 0;
-    t->capacity = 0;
-}
-
 /* Collect all edges of certain types into an array (preserves order) */
 static Edge **collect_body_edges(Node *n, int *out_count) {
-    /* First pass: count */
     int count = 0;
     for (Edge *e = n->outgoing; e; e = e->next) {
         if (e->type == EDGE_DEFINED_BY_BASE ||
@@ -152,7 +138,6 @@ void rule_free(Rule *r) {
     if (r->arith_exprs) free(r->arith_exprs);
     if (r->arith_result_vars) free(r->arith_result_vars);
     
-    /* Free ArgBindings */
     for (int i = 0; i < r->arg_binding_count; i++) {
         free(r->arg_bindings[i].var_name);
         free(r->arg_bindings[i].locations);
@@ -201,7 +186,6 @@ void closure_dump(const ClosureIR *c) {
         }
         printf("\n");
         
-        /* Dump bindings if any */
         if (r->arg_binding_count > 0) {
             printf("    Bindings:\n");
             for (int i = 0; i < r->arg_binding_count; i++) {
@@ -324,6 +308,38 @@ ClosureIR *synthesize(const Graph *g) {
             r->arith_exprs[idx] = copy_expr(arith_edge->arith_expr);
             r->arith_result_vars[idx] = strdup(arith_edge->arith_result_var);
             
+            /* Build ArgBindings from regular edges */
+            BindingTable bt;
+            binding_table_init(&bt);
+            
+            int edge_idx = 0;
+            for (Edge *e = n->outgoing; e; e = e->next) {
+                if (e->type == EDGE_DEFINED_BY_ARITHMETIC) continue;
+                
+                for (int j = 0; j < e->var_binding_count; j++) {
+                    const char *var = e->var_bindings[j].var_name;
+                    int bidx = binding_table_find_or_create(&bt, var);
+                    binding_table_add_location(&bt, bidx, edge_idx, e->var_bindings[j].arg_index);
+                }
+                edge_idx++;
+            }
+            
+            /* Add arithmetic result variable as HEAD binding at last position */
+            if (arith_edge->arith_result_var) {
+                int bidx = binding_table_find_or_create(&bt, arith_edge->arith_result_var);
+                bt.bindings[bidx].is_head = 1;
+                bt.bindings[bidx].head_arg_index = n->arity - 1;
+            }
+            
+            /* Mark other head params */
+            if (n->head_params && n->head_param_count > 0) {
+                binding_table_mark_head(&bt, n->head_params, n->head_param_count);
+            }
+            
+            /* Transfer to rule */
+            r->arg_bindings = bt.bindings;
+            r->arg_binding_count = bt.count;
+            
             if (!closure->rules) {
                 closure->rules = r;
             } else {
@@ -356,7 +372,6 @@ ClosureIR *synthesize(const Graph *g) {
         r->arith_exprs = NULL;
         r->arith_result_vars = NULL;
         
-        /* Build body arrays */
         for (int i = 0; i < body_count; i++) {
             Edge *e = body_edges[i];
             r->body_preds[i] = strdup(e->target->name);
@@ -364,7 +379,6 @@ ClosureIR *synthesize(const Graph *g) {
             r->body_negative[i] = (e->type == EDGE_DEFINED_BY_NEGATION);
         }
         
-        /* Detect recursion */
         r->is_recursive = 0;
         for (int k = 0; k < r->body_count; k++) {
             if (strcmp(r->body_preds[k], r->head) == 0) {
@@ -386,15 +400,12 @@ ClosureIR *synthesize(const Graph *g) {
             }
         }
         
-        /* Mark which bindings appear in head */
         if (n->head_params && n->head_param_count > 0) {
             binding_table_mark_head(&bt, n->head_params, n->head_param_count);
         }
         
-        /* Transfer to rule (takes ownership) */
         r->arg_bindings = bt.bindings;
         r->arg_binding_count = bt.count;
-        /* bt struct is now empty — no need to free */
         
         free(body_edges);
         

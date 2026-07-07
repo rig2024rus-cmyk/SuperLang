@@ -1,22 +1,20 @@
-# Космический калькулятор: считаем суммарную энергию звёздных систем
-# Комбинация отношений + агрегатов + арифметики
+# Cosmic Calculator: комбинация отношений + агрегатов + арифметики
+# Считаем энергию звёздных систем: количество планет * энергия звезды
 
 entity Star
 entity Planet
 relation Orbits(Planet, Star)
 relation Energy(Star, Number)
 
-# Шаг 1: Декларативно определяем "звёздные системы" (планеты, орбитирующие звезду)
-derive system_star(planet, star)
-  from Orbits(planet, star)
+# Шаг 1: Подсчёт планет у каждой звезды (агрегат count)
+derive system_energy(star, total_planets)
+  from total_planets = count(Orbits(planet, star), planet)
 
-# Шаг 2: Энергия системы = энергия звезды * количество планет (агрегат)
-derive system_energy(star, total)
-  from sum(Orbits(planet, star), planet) as total_planets
-
-# Шаг 3: Применяем арифметику: итоговая энергия = энергия_звезды * число_планет
+# Шаг 2: Финальная энергия = energy_star * planet_count
+# Арифметика с positional binding: arg0 = 1й аргумент 1го атома (energy),
+#                                    arg1 = 2й аргумент 2го атома (total_planets)
 derive final_energy(star, result)
-  from Energy(star, arg1), system_energy(star, arg2), result = arg1 * arg2
+  from Energy(star, arg0), system_energy(star, arg1), result = arg0 * arg1
 
 input {
   Star(Sol)
@@ -33,10 +31,8 @@ input {
   Energy(Alpha_Centauri, 150)
 }
 
-# Сколько планет у каждой звезды?
-query system_energy(Sol, 3)            # TRUE (3 планеты)
-query system_energy(Alpha_Centauri, 1) # TRUE (1 планета)
-
-# Финальная энергия системы?
-query final_energy(Sol, 300)            # TRUE (100 * 3)
+# Проверки
+query system_energy(Sol, 3)             # TRUE (3 планеты: Earth, Mars, Venus)
+query system_energy(Alpha_Centauri, 1)  # TRUE (1 планета: Proxima_b)
+query final_energy(Sol, 300)             # TRUE (100 * 3)
 query final_energy(Alpha_Centauri, 150) # TRUE (150 * 1)
