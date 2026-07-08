@@ -361,7 +361,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
             }
             VarBindings vbinds = { bind_names, bind_values_arr, bind_count };
 
-            /* Проверка фильтров сравнения */
+            /* Проверка фильтров сравнения (v1.0) */
             if (r->comparisons && r->comparisons[arith_slot] && r->comparison_counts[arith_slot] > 0) {
                 if (!eval_comparisons(r->comparisons[arith_slot], r->comparison_counts[arith_slot], &vbinds)) {
                     free(bind_names);
@@ -434,6 +434,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
 static int apply_rule_general(Config *c, const Rule *r) {
     if (r->body_count == 0) return 0;
 
+    /* Разделяем positive и negative atoms */
     int pos_indices[32], neg_indices[32];
     int pos_count = 0, neg_count = 0;
     for (int i = 0; i < r->body_count; i++) {
@@ -442,6 +443,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
     }
     if (pos_count == 0) return 0;
 
+    /* Собираем списки фактов для каждого positive atom */
     Fact ***pos_fact_lists = malloc(sizeof(Fact**) * pos_count);
     int *pos_fact_counts = calloc(pos_count, sizeof(int));
     for (int p = 0; p < pos_count; p++) {
@@ -465,6 +467,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
         }
     }
 
+    /* Маппинг atom_index -> pos slot */
     int atom_to_pos[32];
     for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
     for (int p = 0; p < pos_count; p++) atom_to_pos[pos_indices[p]] = p;
@@ -484,6 +487,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
         for (int p = 0; p < pos_count; p++)
             current_facts[p] = pos_fact_lists[p][indices[p]];
 
+        /* ===== ШАГ 1: Unification (связывание переменных) ===== */
         int combination_valid = 1;
         for (int b = 0; b < r->arg_binding_count; b++) {
             ArgBinding *bind = &r->arg_bindings[b];
@@ -509,7 +513,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
             if (!combination_valid) break;
         }
 
-        /* Проверка фильтров сравнения */
+        /* ===== ШАГ 2: Проверка фильтров сравнения (НОВОЕ v1.0) ===== */
         if (combination_valid && r->comparisons && r->comparison_counts) {
             const char **bind_names = malloc(sizeof(const char*) * r->arg_binding_count);
             const char **bind_values_arr = malloc(sizeof(const char*) * r->arg_binding_count);
@@ -524,15 +528,19 @@ static int apply_rule_general(Config *c, const Rule *r) {
 
             for (int i = 0; i < r->body_count && combination_valid; i++) {
                 if (r->comparisons[i] && r->comparison_counts[i] > 0) {
-                    if (!eval_comparisons(r->comparisons[i], r->comparison_counts[i], &vbinds)) {
+                    if (!eval_comparisons(r->comparisons[i],
+                                          r->comparison_counts[i],
+                                          &vbinds)) {
                         combination_valid = 0;
                     }
                 }
             }
+
             free(bind_names);
             free(bind_values_arr);
         }
 
+        /* ===== ШАГ 3: Проверка negative atoms ===== */
         if (combination_valid) {
             for (int n = 0; n < neg_count && combination_valid; n++) {
                 int atom_idx = neg_indices[n];
@@ -560,6 +568,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
             }
         }
 
+        /* ===== ШАГ 4: Создание head fact ===== */
         if (combination_valid && r->head_arity > 0) {
             char *head_args[32];
             int head_valid = 1;
@@ -579,6 +588,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
             }
         }
 
+        /* Инкремент счётчика комбинаций */
         int carry = 1;
         for (int p = pos_count - 1; p >= 0 && carry; p--) {
             indices[p]++;
