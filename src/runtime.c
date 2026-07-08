@@ -126,20 +126,30 @@ typedef struct {
     int count;
 } VarBindings;
 
+/* ========================================================================= */
+/* Expression evaluator — recursive descent with built-in function support   */
+/* v1.1: added EXPR_CALL handling for sqrt, pow, sin, cos, etc.              */
+/* ========================================================================= */
+
 static double eval_expr(const Expr *e, const VarBindings *binds) {
     if (!e) return 0.0;
+
     switch (e->type) {
-        case EXPR_NUMBER: return e->number;
+        case EXPR_NUMBER:
+            return e->number;
+
         case EXPR_VARIABLE:
+            /* Look up variable value, parse as double */
             for (int i = 0; i < binds->count; i++) {
                 if (strcmp(binds->names[i], e->var_name) == 0) {
                     char *endptr;
                     double val = strtod(binds->values[i], &endptr);
                     if (*endptr == '\0') return val;
-                    return 0.0;
+                    return 0.0;  /* not a valid number */
                 }
             }
-            return 0.0;
+            return 0.0;  /* variable not bound */
+
         case EXPR_BINARY: {
             double left = eval_expr(e->binary.left, binds);
             double right = eval_expr(e->binary.right, binds);
@@ -148,15 +158,56 @@ static double eval_expr(const Expr *e, const VarBindings *binds) {
                 case '-': return left - right;
                 case '*': return left * right;
                 case '/': return (right == 0.0) ? 0.0 : left / right;
-                case '%': {
-                    if (right == 0.0) return 0.0;
-                    return fmod(left, right);
-                }
+                case '%': return (right == 0.0) ? 0.0 : fmod(left, right);
             }
             return 0.0;
         }
+
         case EXPR_UNARY_MINUS:
             return -eval_expr(e->operand, binds);
+
+        /* NEW in v1.1: built-in function calls */
+        case EXPR_CALL: {
+            /* Evaluate all arguments first */
+            double arg_values[8];  /* max 8 arguments supported */
+            int n_args = e->call.arg_count;
+            if (n_args > 8) n_args = 8;
+            for (int i = 0; i < n_args; i++) {
+                arg_values[i] = eval_expr(e->call.args[i], binds);
+            }
+            const char *fn = e->call.func_name;
+
+            /* 1-argument functions */
+            if (n_args == 1) {
+                double x = arg_values[0];
+                if (strcmp(fn, "sqrt") == 0)  return (x >= 0.0) ? sqrt(x) : 0.0;
+                if (strcmp(fn, "abs") == 0)   return fabs(x);
+                if (strcmp(fn, "sin") == 0)   return sin(x);
+                if (strcmp(fn, "cos") == 0)   return cos(x);
+                if (strcmp(fn, "tan") == 0)   return tan(x);
+                if (strcmp(fn, "asin") == 0)  return asin(x);
+                if (strcmp(fn, "acos") == 0)  return acos(x);
+                if (strcmp(fn, "atan") == 0)  return atan(x);
+                if (strcmp(fn, "exp") == 0)   return exp(x);
+                if (strcmp(fn, "log") == 0)   return (x > 0.0) ? log(x) : 0.0;
+                if (strcmp(fn, "log10") == 0) return (x > 0.0) ? log10(x) : 0.0;
+                if (strcmp(fn, "floor") == 0) return floor(x);
+                if (strcmp(fn, "ceil") == 0)  return ceil(x);
+                if (strcmp(fn, "round") == 0) return round(x);
+            }
+            /* 2-argument functions */
+            else if (n_args == 2) {
+                double x = arg_values[0];
+                double y = arg_values[1];
+                if (strcmp(fn, "pow") == 0)   return pow(x, y);
+                if (strcmp(fn, "fmod") == 0)  return (y != 0.0) ? fmod(x, y) : 0.0;
+                if (strcmp(fn, "atan2") == 0) return atan2(y, x);
+                if (strcmp(fn, "fmin") == 0)  return fmin(x, y);   /* ← ИЗМЕНЕНО с min */
+                if (strcmp(fn, "fmax") == 0)  return fmax(x, y);   /* ← ИЗМЕНЕНО с max */
+            }
+            /* Unknown function or wrong arity — return 0 */
+            return 0.0;
+        }
     }
     return 0.0;
 }
@@ -350,71 +401,68 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
         }
 
         if (combination_valid) {
-            const char **bind_names = malloc(sizeof(const char*) * r->arg_binding_count);
-            const char **bind_values_arr = malloc(sizeof(const char*) * r->arg_binding_count);
-            int bind_count = 0;
-            for (int b = 0; b < r->arg_binding_count; b++) {
-                if (binding_values[b] == NULL) continue;
-                bind_names[bind_count] = r->arg_bindings[b].var_name;
-                bind_values_arr[bind_count] = binding_values[b];
-                bind_count++;
-            }
-            VarBindings vbinds = { bind_names, bind_values_arr, bind_count };
+    const char **bind_names = malloc(sizeof(const char*) * r->arg_binding_count);
+    const char **bind_values_arr = malloc(sizeof(const char*) * r->arg_binding_count);
+    int bind_count = 0;
+    for (int b = 0; b < r->arg_binding_count; b++) {
+        if (binding_values[b] == NULL) continue;
+        bind_names[bind_count] = r->arg_bindings[b].var_name;
+        bind_values_arr[bind_count] = binding_values[b];
+        bind_count++;
+    }
+    VarBindings vbinds = { bind_names, bind_values_arr, bind_count };
 
-            /* Проверка фильтров сравнения (v1.0) */
-            if (r->comparisons && r->comparisons[arith_slot] && r->comparison_counts[arith_slot] > 0) {
-                if (!eval_comparisons(r->comparisons[arith_slot], r->comparison_counts[arith_slot], &vbinds)) {
-                    free(bind_names);
-                    free(bind_values_arr);
-                    free(binding_values);
-                    combination_valid = 0;
-                }
-            }
-
-            if (combination_valid) {
-                double val = eval_expr(r->arith_exprs[arith_slot], &vbinds);
-
-                char **result_args = calloc(r->head_arity, sizeof(char*));
-                int *is_our_alloc = calloc(r->head_arity, sizeof(int));
-                int head_valid = 1;
-
-                for (int j = 0; j < r->head_arity; j++) {
-                    int found = -1;
-                    for (int b = 0; b < r->arg_binding_count; b++) {
-                        if (r->arg_bindings[b].is_head && r->arg_bindings[b].head_arg_index == j) {
-                            found = b; break;
-                        }
-                    }
-                    if (found < 0 || binding_values[found] == NULL) {
-                        if (j == r->head_arity - 1) {
-                            char buf[64];
-                            if (val == (int)val && fabs(val) < 1e15)
-                                snprintf(buf, sizeof(buf), "%d", (int)val);
-                            else
-                                snprintf(buf, sizeof(buf), "%.2f", val);
-                            result_args[j] = strdup(buf);
-                            is_our_alloc[j] = 1;
-                        } else { head_valid = 0; break; }
-                    } else {
-                        result_args[j] = binding_values[found];
-                        is_our_alloc[j] = 0;
-                    }
-                }
-
-                if (head_valid && !fact_exists(c, r->head, r->head_arity, result_args)) {
-                    add_fact_direct(c, r->head, r->head_arity, result_args);
-                    added++;
-                }
-
-                for (int j = 0; j < r->head_arity; j++) {
-                    if (is_our_alloc[j]) free(result_args[j]);
-                }
-                free(result_args);
-                free(is_our_alloc);
-            }
-            free(bind_names);
-            free(bind_values_arr);
+    /* Проверка фильтров сравнения (v1.0) — ИСПРАВЛЕНО */
+    if (r->comparisons && r->comparisons[arith_slot] && r->comparison_counts[arith_slot] > 0) {
+        if (!eval_comparisons(r->comparisons[arith_slot], r->comparison_counts[arith_slot], &vbinds)) {
+            combination_valid = 0;
         }
+    }
+
+    if (combination_valid) {
+        double val = eval_expr(r->arith_exprs[arith_slot], &vbinds);
+
+        char **result_args = calloc(r->head_arity, sizeof(char*));
+        int *is_our_alloc = calloc(r->head_arity, sizeof(int));
+        int head_valid = 1;
+
+        for (int j = 0; j < r->head_arity; j++) {
+            int found = -1;
+            for (int b = 0; b < r->arg_binding_count; b++) {
+                if (r->arg_bindings[b].is_head && r->arg_bindings[b].head_arg_index == j) {
+                    found = b; break;
+                }
+            }
+            if (found < 0 || binding_values[found] == NULL) {
+                if (j == r->head_arity - 1) {
+                    char buf[64];
+                    if (val == (int)val && fabs(val) < 1e15)
+                        snprintf(buf, sizeof(buf), "%d", (int)val);
+                    else
+                        snprintf(buf, sizeof(buf), "%.2f", val);
+                    result_args[j] = strdup(buf);
+                    is_our_alloc[j] = 1;
+                } else { head_valid = 0; break; }
+            } else {
+                result_args[j] = binding_values[found];
+                is_our_alloc[j] = 0;
+            }
+        }
+
+        if (head_valid && !fact_exists(c, r->head, r->head_arity, result_args)) {
+            add_fact_direct(c, r->head, r->head_arity, result_args);
+            added++;
+        }
+
+        for (int j = 0; j < r->head_arity; j++) {
+            if (is_our_alloc[j]) free(result_args[j]);
+        }
+        free(result_args);
+        free(is_our_alloc);
+    }
+    free(bind_names);
+    free(bind_values_arr);
+}
 
         if (binding_values) free(binding_values);
 

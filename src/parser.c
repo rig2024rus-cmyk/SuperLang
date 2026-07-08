@@ -8,13 +8,22 @@ typedef struct {
     size_t pos;
 } Parser;
 
+/* ========================================================================= */
+/* Program allocation                                                        */
+/* ========================================================================= */
+
 Program *program_new(void) {
     Program *p = calloc(1, sizeof(Program));
     return p;
 }
 
+/* ========================================================================= */
+/* Expression constructors                                                   */
+/* ========================================================================= */
+
 Expr *expr_new_number(double n, SourceLocation loc) {
     Expr *e = calloc(1, sizeof(Expr));
+    if (!e) return NULL;
     e->type = EXPR_NUMBER;
     e->number = n;
     e->loc = loc;
@@ -23,14 +32,20 @@ Expr *expr_new_number(double n, SourceLocation loc) {
 
 Expr *expr_new_variable(const char *name, SourceLocation loc) {
     Expr *e = calloc(1, sizeof(Expr));
+    if (!e) return NULL;
     e->type = EXPR_VARIABLE;
     e->var_name = strdup(name);
+    if (!e->var_name) {
+        free(e);
+        return NULL;
+    }
     e->loc = loc;
     return e;
 }
 
 Expr *expr_new_binary(char op, Expr *left, Expr *right, SourceLocation loc) {
     Expr *e = calloc(1, sizeof(Expr));
+    if (!e) return NULL;
     e->type = EXPR_BINARY;
     e->binary.op = op;
     e->binary.left = left;
@@ -41,27 +56,95 @@ Expr *expr_new_binary(char op, Expr *left, Expr *right, SourceLocation loc) {
 
 Expr *expr_new_unary_minus(Expr *operand, SourceLocation loc) {
     Expr *e = calloc(1, sizeof(Expr));
+    if (!e) return NULL;
     e->type = EXPR_UNARY_MINUS;
     e->operand = operand;
     e->loc = loc;
     return e;
 }
 
+/* ========================================================================= */
+/* КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ v1.1:                                             */
+/* expr_new_call теперь принимает ownership strdup'нутой строки func_name.  */
+/* НЕ делает внутреннего strdup — это устраняет двойной strdup и утечку.   */
+/* ========================================================================= */
+
+Expr *expr_new_call(const char *func_name, Expr **args, int arg_count, SourceLocation loc) {
+    Expr *e = calloc(1, sizeof(Expr));
+    if (!e) {
+        /* OOM — освобождаем args массив (ownership всё ещё у вызывающего) */
+        if (args) {
+            for (int i = 0; i < arg_count; i++) {
+                if (args[i]) expr_free(args[i]);
+            }
+            free(args);
+        }
+        return NULL;
+    }
+    e->type = EXPR_CALL;
+    /* ВАЖНО: берём ownership напрямую, БЕЗ strdup.
+     * func_name должен быть strdup'нут вызывающей функцией (parse_factor). */
+    e->call.func_name = (char*)func_name;
+    e->call.args = args;  /* ownership массива тоже переходит */
+    e->call.arg_count = arg_count;
+    e->loc = loc;
+    return e;
+}
+
+/* ========================================================================= */
+/* Recursive expression destructor                                           */
+/* ========================================================================= */
+
 void expr_free(Expr *e) {
     if (!e) return;
     switch (e->type) {
-        case EXPR_NUMBER: break;
-        case EXPR_VARIABLE: free(e->var_name); break;
-        case EXPR_BINARY:
-            expr_free(e->binary.left);
-            expr_free(e->binary.right);
+        case EXPR_NUMBER:
             break;
+
+        case EXPR_VARIABLE:
+            if (e->var_name) {
+                free(e->var_name);
+                e->var_name = NULL;
+            }
+            break;
+
+        case EXPR_BINARY:
+            if (e->binary.left) expr_free(e->binary.left);
+            if (e->binary.right) expr_free(e->binary.right);
+            e->binary.left = NULL;
+            e->binary.right = NULL;
+            break;
+
         case EXPR_UNARY_MINUS:
-            expr_free(e->operand);
+            if (e->operand) expr_free(e->operand);
+            e->operand = NULL;
+            break;
+
+        case EXPR_CALL:
+            if (e->call.func_name) {
+                free(e->call.func_name);
+                e->call.func_name = NULL;
+            }
+            if (e->call.args) {
+                for (int i = 0; i < e->call.arg_count; i++) {
+                    if (e->call.args[i]) {
+                        expr_free(e->call.args[i]);
+                        e->call.args[i] = NULL;
+                    }
+                }
+                free(e->call.args);
+                e->call.args = NULL;
+            }
+            e->call.arg_count = 0;
             break;
     }
+    e->type = EXPR_NUMBER;
     free(e);
 }
+
+/* ========================================================================= */
+/* Comparison destructor                                                     */
+/* ========================================================================= */
 
 void comparison_free(Comparison *c) {
     if (!c) return;
@@ -69,14 +152,20 @@ void comparison_free(Comparison *c) {
     if (c->right) expr_free(c->right);
 }
 
+/* ========================================================================= */
+/* Expression debug output                                                   */
+/* ========================================================================= */
+
 void expr_dump(const Expr *e, int indent) {
     if (!e) return;
     for (int i = 0; i < indent; i++) printf("  ");
     switch (e->type) {
         case EXPR_NUMBER:
-            printf("NUM %g\n", e->number); break;
+            printf("NUM %g\n", e->number);
+            break;
         case EXPR_VARIABLE:
-            printf("VAR %s\n", e->var_name); break;
+            printf("VAR %s\n", e->var_name);
+            break;
         case EXPR_BINARY:
             printf("BIN '%c'\n", e->binary.op);
             expr_dump(e->binary.left, indent + 1);
@@ -86,8 +175,18 @@ void expr_dump(const Expr *e, int indent) {
             printf("UNARY -\n");
             expr_dump(e->operand, indent + 1);
             break;
+        case EXPR_CALL:
+            printf("CALL %s(%d args)\n", e->call.func_name, e->call.arg_count);
+            for (int i = 0; i < e->call.arg_count; i++) {
+                expr_dump(e->call.args[i], indent + 1);
+            }
+            break;
     }
 }
+
+/* ========================================================================= */
+/* Atom, Condition, ArithAssignment construction and destruction             */
+/* ========================================================================= */
 
 void atom_init(Atom *a, const char *predicate, int negated, SourceLocation loc) {
     a->predicate = strdup(predicate);
@@ -171,13 +270,18 @@ void query_free(Query *q) {
     free(q->args);
 }
 
-static void entity_decl_free(EntityDecl *e) { if (!e) return; free(e->name); }
+static void entity_decl_free(EntityDecl *e) {
+    if (!e) return;
+    free(e->name);
+}
+
 static void relation_decl_free(RelationDecl *r) {
     if (!r) return;
     free(r->name);
     for (int i = 0; i < r->param_count; i++) free(r->params[i]);
     free(r->params);
 }
+
 static void observe_decl_free(ObserveDecl *o) {
     if (!o) return;
     free(o->name);
@@ -185,6 +289,7 @@ static void observe_decl_free(ObserveDecl *o) {
     free(o->params);
     condition_free(&o->condition);
 }
+
 static void derive_decl_free(DeriveDecl *d) {
     if (!d) return;
     free(d->name);
@@ -209,6 +314,10 @@ void program_free(Program *p) {
     free(p->queries);
     free(p);
 }
+
+/* ========================================================================= */
+/* Program debug output                                                      */
+/* ========================================================================= */
 
 void program_dump(const Program *p) {
     printf("Program:\n");
@@ -280,6 +389,10 @@ void program_dump(const Program *p) {
         printf(")  @%d:%d\n", p->queries[i].loc.line, p->queries[i].loc.column);
     }
 }
+
+/* ========================================================================= */
+/* Parser helpers                                                            */
+/* ========================================================================= */
 
 static Token *parser_current(Parser *p) {
     if (p->pos < p->tokens->count) {
@@ -368,6 +481,10 @@ static void parser_parse_arg_list(Parser *p, char ***out_args, int *out_count, P
     }
 }
 
+/* ========================================================================= */
+/* Expression parser                                                         */
+/* ========================================================================= */
+
 static Expr *parse_expr(Parser *p, ParseResult *result);
 
 static Expr *parse_factor(Parser *p, ParseResult *result) {
@@ -383,23 +500,107 @@ static Expr *parse_factor(Parser *p, ParseResult *result) {
     if (tok->type == TOK_MINUS) {
         p->pos++;
         Expr *operand = parse_factor(p, result);
-        if (!result->is_valid) return NULL;
+        if (!result->is_valid) {
+            if (operand) expr_free(operand);
+            return NULL;
+        }
         return expr_new_unary_minus(operand, loc);
     }
 
     if (tok->type == TOK_LPAREN) {
         p->pos++;
         Expr *inner = parse_expr(p, result);
-        if (!result->is_valid) return NULL;
+        if (!result->is_valid) {
+            if (inner) expr_free(inner);
+            return NULL;
+        }
         if (!parser_consume(p, TOK_RPAREN, result)) {
-            expr_free(inner);
+            if (inner) expr_free(inner);
             return NULL;
         }
         return inner;
     }
 
     if (tok->type == TOK_IDENT) {
+        int is_function_call = (p->pos + 1 < p->tokens->count &&
+                                 p->tokens->tokens[p->pos + 1].type == TOK_LPAREN);
+
+        if (is_function_call) {
+            /* strdup имени функции — ownership будет передан в expr_new_call */
+            char *func_name = strdup(tok->value);
+            if (!func_name) {
+                result->error_message = strdup("Out of memory");
+                result->error_line = loc.line;
+                result->error_column = loc.column;
+                result->is_valid = 0;
+                return NULL;
+            }
+
+            p->pos++;
+            p->pos++;
+
+            Expr **args = NULL;
+            int arg_count = 0;
+            int arg_cap = 0;
+            int success = 1;
+
+            if (parser_current(p)->type != TOK_RPAREN) {
+                arg_cap = 4;
+                args = malloc(sizeof(Expr*) * arg_cap);
+                if (!args) {
+                    free(func_name);
+                    result->error_message = strdup("Out of memory");
+                    result->is_valid = 0;
+                    return NULL;
+                }
+
+                Expr *first_arg = parse_expr(p, result);
+                if (!result->is_valid) {
+                    free(func_name);
+                    free(args);
+                    success = 0;
+                } else {
+                    args[0] = first_arg;
+                    arg_count = 1;
+                }
+
+                while (success && parser_match(p, TOK_COMMA)) {
+                    Expr *next_arg = parse_expr(p, result);
+                    if (!result->is_valid) {
+                        success = 0;
+                        break;
+                    }
+                    if (arg_count >= arg_cap) {
+                        arg_cap *= 2;
+                        args = realloc(args, sizeof(Expr*) * arg_cap);
+                    }
+                    args[arg_count++] = next_arg;
+                }
+            }
+
+            if (success && !parser_consume(p, TOK_RPAREN, result)) {
+                success = 0;
+            }
+
+            if (!success) {
+                for (int i = 0; i < arg_count; i++) {
+                    if (args && args[i]) expr_free(args[i]);
+                }
+                if (args) free(args);
+                free(func_name);
+                return NULL;
+            }
+
+            /* Передаём ownership func_name и args в expr_new_call */
+            return expr_new_call(func_name, args, arg_count, loc);
+        }
+
         Expr *e = expr_new_variable(tok->value, loc);
+        if (!e) {
+            result->error_message = strdup("Out of memory");
+            result->is_valid = 0;
+            return NULL;
+        }
         p->pos++;
         return e;
     }
@@ -455,6 +656,10 @@ static Expr *parse_expr(Parser *p, ParseResult *result) {
     }
     return left;
 }
+
+/* ========================================================================= */
+/* Atom parser                                                               */
+/* ========================================================================= */
 
 static void parser_parse_atom(Parser *p, Atom *out, ParseResult *result) {
     SourceLocation loc = parser_loc(p);
@@ -569,6 +774,10 @@ static void parser_parse_atom(Parser *p, Atom *out, ParseResult *result) {
     }
 }
 
+/* ========================================================================= */
+/* Condition parser                                                          */
+/* ========================================================================= */
+
 static void parser_parse_condition(Parser *p, Condition *out, ParseResult *result) {
     SourceLocation loc = parser_loc(p);
     condition_init(out, loc);
@@ -602,6 +811,7 @@ static void parser_parse_condition(Parser *p, Condition *out, ParseResult *resul
                     Expr *expr = parse_expr(p, result);
                     if (!result->is_valid) {
                         if (expr) expr_free(expr);
+                        expr = NULL;
                         return;
                     }
                     ArithAssignment a;
@@ -620,10 +830,16 @@ static void parser_parse_condition(Parser *p, Condition *out, ParseResult *resul
             Expr *left = parse_expr(p, result);
 
             if (!result->is_valid) {
-                if (left) expr_free(left);
+                if (left) {
+                    expr_free(left);
+                    left = NULL;
+                }
                 free(result->error_message);
                 result->error_message = NULL;
+                result->error_line = 0;
+                result->error_column = 0;
                 result->is_valid = 1;
+
                 p->pos = saved_pos;
                 Atom atom;
                 parser_parse_atom(p, &atom, result);
@@ -660,8 +876,12 @@ static void parser_parse_condition(Parser *p, Condition *out, ParseResult *resul
                     cmp.loc = cmp_loc;
                     condition_add_comparison(out, &cmp);
                 } else {
-                    expr_free(left);
+                    if (left) {
+                        expr_free(left);
+                        left = NULL;
+                    }
                     p->pos = saved_pos;
+
                     Atom atom;
                     parser_parse_atom(p, &atom, result);
                     if (!result->is_valid) return;
@@ -673,6 +893,10 @@ static void parser_parse_condition(Parser *p, Condition *out, ParseResult *resul
         if (!parser_match(p, TOK_COMMA)) break;
     }
 }
+
+/* ========================================================================= */
+/* Declaration parsers                                                       */
+/* ========================================================================= */
 
 static void parser_parse_entity(Parser *p, Program *prog, ParseResult *result) {
     SourceLocation loc = parser_loc(p);
@@ -859,6 +1083,10 @@ static void parser_parse_query(Parser *p, Program *prog, ParseResult *result) {
     q->arg_count = arg_count;
     q->loc = loc;
 }
+
+/* ========================================================================= */
+/* Top-level parse entry point                                               */
+/* ========================================================================= */
 
 ParseResult parser_parse(const TokenList *tokens) {
     ParseResult result;

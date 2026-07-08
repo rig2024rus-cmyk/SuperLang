@@ -1,0 +1,51 @@
+# ===========================================================================
+# Тест встроенных математических функций (Шаг A.1, v1.1)
+# ===========================================================================
+
+[--
+    Многострочный комментарий:
+    Проверяем работу sqrt, pow, abs, fmin.
+    Примечание: используем fmin/fmax вместо min/max,
+    так как min/max — ключевые слова для агрегатов.
+    Это соответствует стандарту C libm (fmin, fmax).
+--]
+
+relation point(x, y)
+
+input {
+    point(3, 4)       # расстояние = 5
+    point(0, 10)      # расстояние = 10
+    point(5, 12)      # расстояние = 13
+    point(1, 1)       # расстояние = sqrt(2)
+}
+
+# --- Тест sqrt ---
+derive distance(x, y, d) from
+    point(x, y),
+    d = sqrt(x*x + y*y)
+
+# --- Тест pow ---
+derive power_test(x, y, p) from
+    point(x, y),
+    p = pow(x, 2) + pow(y, 2)
+
+# --- Тест abs ---
+derive abs_diff(x, y, d) from
+    point(x, y),
+    d = abs(x - y)
+
+# --- Тест fmin (float minimum) ---
+derive min_test(x, y, mn) from
+    point(x, y),
+    mn = fmin(x, y)
+
+# --- Тест fmax (float maximum) ---
+derive max_test(x, y, mx) from
+    point(x, y),
+    mx = fmax(x, y)
+
+query distance(!X, !Y, !D)
+query power_test(!X, !Y, !P)
+query abs_diff(!X, !Y, !D)
+query min_test(!X, !Y, !Min)
+query max_test(!X, !Y, !Max)

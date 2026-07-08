@@ -51,6 +51,12 @@ static void append_edge(Node *from, Edge *e) {
     }
 }
 
+/* ========================================================================= */
+/* Deep copy expression (v1.1 с защитой от OOM и обработкой EXPR_CALL)       */
+/* КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: для EXPR_CALL делаем strdup(func_name) перед    */
+/* вызовом expr_new_call, потому что expr_new_call теперь забирает ownership */
+/* ========================================================================= */
+
 static Expr *copy_expr(const Expr *e) {
     if (!e) return NULL;
     switch (e->type) {
@@ -58,18 +64,62 @@ static Expr *copy_expr(const Expr *e) {
             return expr_new_number(e->number, e->loc);
         case EXPR_VARIABLE:
             return expr_new_variable(e->var_name, e->loc);
-        case EXPR_BINARY:
-            return expr_new_binary(e->binary.op,
-                                   copy_expr(e->binary.left),
-                                   copy_expr(e->binary.right),
-                                   e->loc);
-        case EXPR_UNARY_MINUS:
-            return expr_new_unary_minus(copy_expr(e->operand), e->loc);
+        case EXPR_BINARY: {
+            Expr *l = copy_expr(e->binary.left);
+            Expr *r = copy_expr(e->binary.right);
+            Expr *result = expr_new_binary(e->binary.op, l, r, e->loc);
+            if (!result) {
+                expr_free(l);
+                expr_free(r);
+                return NULL;
+            }
+            return result;
+        }
+        case EXPR_UNARY_MINUS: {
+            Expr *inner = copy_expr(e->operand);
+            Expr *result = expr_new_unary_minus(inner, e->loc);
+            if (!result) {
+                expr_free(inner);
+                return NULL;
+            }
+            return result;
+        }
+        /* КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: strdup перед expr_new_call */
+        case EXPR_CALL: {
+            Expr **args_copy = NULL;
+            if (e->call.arg_count > 0) {
+                args_copy = calloc(e->call.arg_count, sizeof(Expr*));
+                if (!args_copy) return NULL;
+                for (int i = 0; i < e->call.arg_count; i++) {
+                    args_copy[i] = copy_expr(e->call.args[i]);
+                    if (!args_copy[i]) {
+                        for (int j = 0; j < i; j++) expr_free(args_copy[j]);
+                        free(args_copy);
+                        return NULL;
+                    }
+                }
+            }
+            /* Создаём НОВУЮ strdup'нутую копию имени функции,
+             * потому что expr_new_call теперь забирает ownership напрямую */
+            char *func_copy = strdup(e->call.func_name);
+            if (!func_copy) {
+                for (int j = 0; j < e->call.arg_count; j++) expr_free(args_copy[j]);
+                free(args_copy);
+                return NULL;
+            }
+            Expr *result = expr_new_call(func_copy, args_copy, e->call.arg_count, e->loc);
+            if (!result) {
+                free(func_copy);
+                for (int j = 0; j < e->call.arg_count; j++) expr_free(args_copy[j]);
+                free(args_copy);
+                return NULL;
+            }
+            return result;
+        }
     }
     return NULL;
 }
 
-/* Deep copy a comparison (v0.8) */
 static Comparison copy_comparison(const Comparison *c) {
     Comparison result;
     result.left = copy_expr(c->left);
@@ -115,7 +165,6 @@ static void add_condition_edges(Graph *g, const char *target_name,
                                 const Condition *cond,
                                 StringSet *base_relations,
                                 StringSet *derived_predicates) {
-    /* Process positive atoms */
     for (int i = 0; i < cond->atom_count; i++) {
         const Atom *atom = &cond->atoms[i];
         if (atom->negated || atom->aggregate_func) continue;
@@ -157,7 +206,6 @@ static void add_condition_edges(Graph *g, const char *target_name,
         }
     }
     
-    /* Process negative atoms */
     for (int i = 0; i < cond->atom_count; i++) {
         const Atom *atom = &cond->atoms[i];
         if (!atom->negated) continue;
@@ -195,7 +243,6 @@ static void add_condition_edges(Graph *g, const char *target_name,
         }
     }
     
-    /* Process aggregate atoms */
     for (int i = 0; i < cond->atom_count; i++) {
         const Atom *atom = &cond->atoms[i];
         if (!atom->aggregate_func) continue;
@@ -226,7 +273,6 @@ static void add_condition_edges(Graph *g, const char *target_name,
         }
     }
     
-    /* Process arithmetic assignments */
     for (int i = 0; i < cond->arith_count; i++) {
         const ArithAssignment *a = &cond->arith_assigns[i];
         Node *from = graph_find_node(g, target_name);
@@ -249,12 +295,11 @@ static void add_condition_edges(Graph *g, const char *target_name,
         g->edge_count++;
     }
     
-    /* Process comparisons (FILTER edge) - v0.8 */
     if (cond->comparison_count > 0) {
         Node *from = graph_find_node(g, target_name);
         if (from) {
             Edge *e = calloc(1, sizeof(Edge));
-            e->target = from;  /* Filter edge points to self */
+            e->target = from;
             e->type = EDGE_DEFINED_BY_FILTER;
             e->aggregate_func = NULL;
             e->aggregate_field = -1;
@@ -323,6 +368,7 @@ TranslationResult ast_to_graph_translate(const Program *program) {
     for (int i = 0; i < program->derive_count; i++) {
         const DeriveDecl *d = &program->derives[i];
         Node *n = graph_add_node(result.graph, d->name, d->param_count, NODE_DERIVED);
+        n->type = NODE_DERIVED;
         node_set_head_params(n, d->params, d->param_count);
         string_set_add(&derived_predicates, d->name);
     }
@@ -330,6 +376,7 @@ TranslationResult ast_to_graph_translate(const Program *program) {
     for (int i = 0; i < program->observe_count; i++) {
         const ObserveDecl *o = &program->observes[i];
         Node *n = graph_add_node(result.graph, o->name, o->param_count, NODE_DERIVED);
+        n->type = NODE_DERIVED;
         node_set_head_params(n, o->params, o->param_count);
         string_set_add(&derived_predicates, o->name);
     }

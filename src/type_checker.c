@@ -168,11 +168,16 @@ static void var_set_free(VarSet *s) {
     s->capacity = 0;
 }
 
-/* Collect variables from expression (v0.8) */
+/* ========================================================================= */
+/* Recursively collect all variable names from an expression                 */
+/* v1.1: added EXPR_CALL handling (recurse into all arguments)               */
+/* ========================================================================= */
+
 static void collect_expr_vars(const Expr *e, VarSet *vars) {
     if (!e) return;
     switch (e->type) {
         case EXPR_NUMBER:
+            /* No variables in a literal */
             break;
         case EXPR_VARIABLE:
             var_set_add(vars, e->var_name);
@@ -183,6 +188,12 @@ static void collect_expr_vars(const Expr *e, VarSet *vars) {
             break;
         case EXPR_UNARY_MINUS:
             collect_expr_vars(e->operand, vars);
+            break;
+        /* NEW in v1.1: collect variables from all function arguments */
+        case EXPR_CALL:
+            for (int i = 0; i < e->call.arg_count; i++) {
+                collect_expr_vars(e->call.args[i], vars);
+            }
             break;
     }
 }

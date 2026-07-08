@@ -3,7 +3,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Deep copy expression */
+/* ========================================================================= */
+/* Deep copy expression (v1.1 с защитой от OOM и обработкой EXPR_CALL)       */
+/* КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: для EXPR_CALL делаем strdup(func_name) перед    */
+/* вызовом expr_new_call, потому что expr_new_call теперь забирает ownership */
+/* ========================================================================= */
+
 static Expr *copy_expr(const Expr *e) {
     if (!e) return NULL;
     switch (e->type) {
@@ -11,24 +16,74 @@ static Expr *copy_expr(const Expr *e) {
             return expr_new_number(e->number, e->loc);
         case EXPR_VARIABLE:
             return expr_new_variable(e->var_name, e->loc);
-        case EXPR_BINARY:
-            return expr_new_binary(e->binary.op,
-                                   copy_expr(e->binary.left),
-                                   copy_expr(e->binary.right),
-                                   e->loc);
-        case EXPR_UNARY_MINUS:
-            return expr_new_unary_minus(copy_expr(e->operand), e->loc);
+        case EXPR_BINARY: {
+            Expr *l = copy_expr(e->binary.left);
+            Expr *r = copy_expr(e->binary.right);
+            Expr *result = expr_new_binary(e->binary.op, l, r, e->loc);
+            if (!result) {
+                expr_free(l);
+                expr_free(r);
+                return NULL;
+            }
+            return result;
+        }
+        case EXPR_UNARY_MINUS: {
+            Expr *inner = copy_expr(e->operand);
+            Expr *result = expr_new_unary_minus(inner, e->loc);
+            if (!result) {
+                expr_free(inner);
+                return NULL;
+            }
+            return result;
+        }
+        /* КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: strdup перед expr_new_call */
+        case EXPR_CALL: {
+            Expr **args_copy = NULL;
+            if (e->call.arg_count > 0) {
+                args_copy = calloc(e->call.arg_count, sizeof(Expr*));
+                if (!args_copy) return NULL;
+                for (int i = 0; i < e->call.arg_count; i++) {
+                    args_copy[i] = copy_expr(e->call.args[i]);
+                    if (!args_copy[i]) {
+                        for (int j = 0; j < i; j++) expr_free(args_copy[j]);
+                        free(args_copy);
+                        return NULL;
+                    }
+                }
+            }
+            char *func_copy = strdup(e->call.func_name);
+            if (!func_copy) {
+                for (int j = 0; j < e->call.arg_count; j++) expr_free(args_copy[j]);
+                free(args_copy);
+                return NULL;
+            }
+            Expr *result = expr_new_call(func_copy, args_copy, e->call.arg_count, e->loc);
+            if (!result) {
+                free(func_copy);
+                for (int j = 0; j < e->call.arg_count; j++) expr_free(args_copy[j]);
+                free(args_copy);
+                return NULL;
+            }
+            return result;
+        }
     }
     return NULL;
 }
 
-/* Deep copy comparisons (v0.8) */
+/* ========================================================================= */
+/* Deep copy comparisons                                                     */
+/* ========================================================================= */
+
 static Comparison *copy_comparisons(const Comparison *src, int count, int *out_count) {
     if (count == 0) {
         *out_count = 0;
         return NULL;
     }
     Comparison *dst = malloc(sizeof(Comparison) * count);
+    if (!dst) {
+        *out_count = 0;
+        return NULL;
+    }
     for (int i = 0; i < count; i++) {
         dst[i].left = copy_expr(src[i].left);
         dst[i].op = src[i].op;
@@ -47,9 +102,9 @@ static void free_comparisons(Comparison *cmps, int count) {
     free(cmps);
 }
 
-/* ====================================================================== */
-/* ArgBinding collection                                                   */
-/* ====================================================================== */
+/* ========================================================================= */
+/* ArgBinding collection                                                     */
+/* ========================================================================= */
 
 typedef struct {
     ArgBinding *bindings;
@@ -103,9 +158,9 @@ static void binding_table_mark_head(BindingTable *t, char **head_params, int hea
     }
 }
 
-/* ====================================================================== */
-/* Helper: add rule to closure list                                        */
-/* ====================================================================== */
+/* ========================================================================= */
+/* Helper: add rule to closure list                                          */
+/* ========================================================================= */
 
 static void add_rule_to_closure(ClosureIR *closure, Rule *r) {
     if (!closure->rules) {
@@ -118,9 +173,9 @@ static void add_rule_to_closure(ClosureIR *closure, Rule *r) {
     closure->rule_count++;
 }
 
-/* ====================================================================== */
-/* Helper: build ArgBindings for a single body edge                        */
-/* ====================================================================== */
+/* ========================================================================= */
+/* Helper: build ArgBindings for a single body edge                          */
+/* ========================================================================= */
 
 static void build_bindings_for_edge(Rule *r, Edge *e, Node *n) {
     BindingTable bt;
@@ -137,9 +192,9 @@ static void build_bindings_for_edge(Rule *r, Edge *e, Node *n) {
     r->arg_binding_count = bt.count;
 }
 
-/* ====================================================================== */
-/* Destructors                                                             */
-/* ====================================================================== */
+/* ========================================================================= */
+/* Destructors                                                               */
+/* ========================================================================= */
 
 void rule_free(Rule *r) {
     if (!r) return;
@@ -164,7 +219,6 @@ void rule_free(Rule *r) {
     if (r->arith_exprs) free(r->arith_exprs);
     if (r->arith_result_vars) free(r->arith_result_vars);
     
-    /* Освобождение comparisons (v0.8) */
     if (r->comparisons) {
         for (int i = 0; i < r->body_count; i++) {
             if (r->comparisons[i]) {
@@ -222,7 +276,6 @@ void closure_dump(const ClosureIR *c) {
         }
         printf("\n");
         
-        /* Dump comparisons (v0.8) */
         if (r->comparisons) {
             int total_cmps = 0;
             for (int i = 0; i < r->body_count; i++) total_cmps += r->comparison_counts[i];
@@ -252,9 +305,9 @@ void closure_dump(const ClosureIR *c) {
     printf("==============================\n");
 }
 
-/* ====================================================================== */
-/* Main synthesis                                                          */
-/* ====================================================================== */
+/* ========================================================================= */
+/* Main synthesis                                                            */
+/* ========================================================================= */
 
 ClosureIR *synthesize(const Graph *g) {
     ClosureIR *closure = calloc(1, sizeof(ClosureIR));
@@ -262,7 +315,9 @@ ClosureIR *synthesize(const Graph *g) {
     for (Node *n = g->nodes; n; n = n->next) {
         if (n->type != NODE_DERIVED) continue;
         
-        /* CASE 1: Node has BASE edges */
+        /* ================================================================= */
+        /* CASE 1: Node has BASE edges                                       */
+        /* ================================================================= */
         int base_edge_count = 0;
         for (Edge *e = n->outgoing; e; e = e->next) {
             if (e->type == EDGE_DEFINED_BY_BASE) {
@@ -297,7 +352,9 @@ ClosureIR *synthesize(const Graph *g) {
             continue;
         }
         
-        /* CASE 2: Aggregate rule */
+        /* ================================================================= */
+        /* CASE 2: Aggregate rule                                            */
+        /* ================================================================= */
         Edge *agg_edge = NULL;
         for (Edge *e = n->outgoing; e; e = e->next) {
             if (e->type == EDGE_DEFINED_BY_AGGREGATE) {
@@ -331,7 +388,9 @@ ClosureIR *synthesize(const Graph *g) {
             continue;
         }
         
-        /* CASE 3: Arithmetic rule */
+        /* ================================================================= */
+        /* CASE 3: Arithmetic rule                                           */
+        /* ================================================================= */
         Edge *arith_edge = NULL;
         for (Edge *e = n->outgoing; e; e = e->next) {
             if (e->type == EDGE_DEFINED_BY_ARITHMETIC) {
@@ -421,7 +480,9 @@ ClosureIR *synthesize(const Graph *g) {
             continue;
         }
         
-        /* CASE 4: General rule */
+        /* ================================================================= */
+        /* CASE 4: General rule                                              */
+        /* ================================================================= */
         int body_count = 0;
         Edge *filter_edge = NULL;
         for (Edge *e = n->outgoing; e; e = e->next) {

@@ -1,0 +1,33 @@
+# ============================================================================
+# Эксперимент 1.0.2: Равноускоренное движение (арифметика в последней позиции)
+# ============================================================================
+
+# Порядок аргументов специально выбран так, чтобы арифметика
+# всегда шла последней — это требование SuperLang v1.0
+
+relation motion(x, v, step)
+
+input {
+    motion(0, 10, 0)    # x=0, v=10, step=0
+}
+
+# Шаг 1: new_x = x + v (арифметика в позиции 2 — последняя)
+derive motion_after_x(v, step, new_x) from
+    motion(x, v, step),
+    new_x = x + v,
+    step < 5
+
+# Шаг 2: new_v = v + 1 (арифметика в позиции 2 — последняя)
+derive motion_after_v(step, new_x, new_v) from
+    motion_after_x(v, step, new_x),
+    new_v = v + 1,
+    step < 5
+
+# Шаг 3: next_step = step + 1 (арифметика в позиции 2 — последняя)
+derive motion(new_x, new_v, next_step) from
+    motion_after_v(step, new_x, new_v),
+    next_step = step + 1,
+    step < 5
+
+# Порядок аргументов в query соответствует новому порядку в motion
+query motion(!X, !V, !Step)

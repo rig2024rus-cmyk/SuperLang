@@ -1,0 +1,51 @@
+# ============================================================================
+# Тест фильтров сравнения в apply_rule_general (v1.0)
+# ============================================================================
+
+relation order(id, total)
+relation emp(id, dept, salary)
+
+input {
+    order(o1, 500)
+    order(o2, 1500)
+    order(o3, 2000)
+    order(o4, 800)
+    order(o5, 1200)
+    
+    emp(e1, engineering, 100000)
+    emp(e2, engineering, 120000)
+    emp(e3, marketing, 90000)
+    emp(e4, hr, 75000)
+}
+
+# Фильтр по > 
+derive high_value(id) from
+    order(id, total),
+    total > 1000
+
+# Фильтр по ==
+derive exactly_1500(id) from
+    order(id, total),
+    total == 1500
+
+# Фильтр по <=
+derive low_value(id) from
+    order(id, total),
+    total <= 800
+
+# Комбинация: фильтр + отрицание
+derive rich_dept(dept) from
+    emp(id, dept, salary),
+    salary >= 100000
+
+# Два фильтра сразу
+derive mid_salary_emp(id) from
+    emp(id, dept, salary),
+    salary > 80000,
+    salary < 110000
+
+query high_value(!X)
+query exactly_1500(!X)
+query low_value(!X)
+query rich_dept(!X)
+query mid_salary_emp(!X)
