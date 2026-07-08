@@ -19,17 +19,19 @@ void graph_free(Graph *g) {
             if (e->aggregate_func) free(e->aggregate_func);
             if (e->arith_result_var) free(e->arith_result_var);
             if (e->arith_expr) expr_free(e->arith_expr);
-            
             for (int i = 0; i < e->var_binding_count; i++) {
                 free(e->var_bindings[i].var_name);
             }
             free(e->var_bindings);
-            
             for (int i = 0; i < e->atom_arg_count; i++) {
                 free(e->atom_args[i]);
             }
             free(e->atom_args);
-            
+            /* Освобождение comparisons (v0.8) */
+            for (int i = 0; i < e->comparison_count; i++) {
+                comparison_free(&e->comparisons[i]);
+            }
+            free(e->comparisons);
             free(e);
             e = next_e;
         }
@@ -47,7 +49,6 @@ void graph_free(Graph *g) {
 Node *graph_add_node(Graph *g, const char *name, int arity, NodeType type) {
     Node *existing = graph_find_node(g, name);
     if (existing) return existing;
-    
     Node *n = calloc(1, sizeof(Node));
     n->name = strdup(name);
     n->arity = arity;
@@ -73,8 +74,9 @@ void graph_add_edge(Graph *g, Node *from, Node *to, EdgeType type) {
     e->var_binding_count = 0;
     e->atom_args = NULL;
     e->atom_arg_count = 0;
+    e->comparisons = NULL;
+    e->comparison_count = 0;
     e->next = NULL;
-    
     if (!from->outgoing) {
         from->outgoing = e;
     } else {
@@ -110,6 +112,7 @@ const char *edge_type_str(EdgeType t) {
         case EDGE_DEFINED_BY_NEGATION: return "defined_by_negation";
         case EDGE_DEFINED_BY_AGGREGATE: return "defined_by_aggregate";
         case EDGE_DEFINED_BY_ARITHMETIC: return "defined_by_arithmetic";
+        case EDGE_DEFINED_BY_FILTER: return "defined_by_filter";
     }
     return "?";
 }
@@ -136,6 +139,10 @@ void graph_dump(const Graph *g) {
             } else if (e->type == EDGE_DEFINED_BY_ARITHMETIC) {
                 printf("    --%s(%s = <expr>)--> %s\n",
                        edge_type_str(e->type), e->arith_result_var,
+                       e->target->name);
+            } else if (e->type == EDGE_DEFINED_BY_FILTER) {
+                printf("    --%s(%d comparisons)--> %s\n",
+                       edge_type_str(e->type), e->comparison_count,
                        e->target->name);
             } else {
                 printf("    --%s--> %s", edge_type_str(e->type), e->target->name);

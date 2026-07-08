@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 
 typedef struct {
     const char *filepath;
@@ -23,10 +24,8 @@ typedef struct {
 static CLIConfig parse_args(int argc, char **argv) {
     CLIConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
-
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
-        
         if (strcmp(arg, "--dump-tokens") == 0) {
             cfg.dump_tokens = 1;
         } else if (strcmp(arg, "--dump-ast") == 0) {
@@ -52,15 +51,14 @@ static CLIConfig parse_args(int argc, char **argv) {
             }
         }
     }
-
     return cfg;
 }
 
 static void print_usage(const char *prog_name) {
     printf("SuperLang — Declarative language for observable properties\n");
-    printf("===========================================================\n\n");
+    printf("===========================================================\n");
     printf("USAGE:\n");
-    printf("    %s [OPTIONS] <file.unq>\n\n", prog_name);
+    printf("    %s [OPTIONS] <file.unq>\n", prog_name);
     printf("OPTIONS:\n");
     printf("    --dump-tokens    Print tokens from lexer\n");
     printf("    --dump-ast       Print parsed AST\n");
@@ -71,7 +69,7 @@ static void print_usage(const char *prog_name) {
     printf("\nEXAMPLE:\n");
     printf("    %s examples/task_ready.unq\n", prog_name);
     printf("    %s --dump-ast --dump-graph examples/task_ready.unq\n", prog_name);
-    printf("    %s --verbose -h\n\n", prog_name);
+    printf("    %s --verbose -h\n", prog_name);
 }
 
 static char *read_file(const char *path, long *out_size) {
@@ -80,54 +78,111 @@ static char *read_file(const char *path, long *out_size) {
         fprintf(stderr, "Cannot open file '%s': %s\n", path, strerror(errno));
         return NULL;
     }
-    
     if (fseek(f, 0, SEEK_END) != 0) {
         fprintf(stderr, "Cannot seek in file '%s'\n", path);
         fclose(f);
         return NULL;
     }
-    
     long size = ftell(f);
     if (size < 0) {
         fprintf(stderr, "Cannot get size of file '%s'\n", path);
         fclose(f);
         return NULL;
     }
-    
     rewind(f);
-    
     char *buffer = malloc((size_t)size + 1);
     if (!buffer) {
         fprintf(stderr, "Out of memory reading file '%s'\n", path);
         fclose(f);
         return NULL;
     }
-    
     size_t read_count = fread(buffer, 1, (size_t)size, f);
     fclose(f);
-    
     if ((long)read_count != size) {
         fprintf(stderr, "Short read on file '%s' (expected %ld, got %zu)\n",
                 path, size, read_count);
         free(buffer);
         return NULL;
     }
-    
     buffer[size] = '\0';
     if (out_size) *out_size = size;
     return buffer;
 }
 
+/* ====================================================================== */
+/* Pattern Matching Engine for Queries (v0.7 - !X prefix)                */
+/* ====================================================================== */
+
+static int is_query_var(const char* name) {
+    return name && name[0] == '!';
+}
+
+typedef struct {
+    const char *target_pred;
+    int target_arity;
+    int *arg_to_var;
+    int var_count;
+    const char **query_args;
+    
+    char ***rows;
+    int row_count;
+    int row_cap;
+    int ground_match;
+} MatchCtx;
+
+static void match_visitor(const char *pred, int arity, const char **args, void *user_data) {
+    MatchCtx *ctx = (MatchCtx *)user_data;
+    
+    if (strcmp(pred, ctx->target_pred) != 0 || arity != ctx->target_arity) return;
+    
+    char **bindings = calloc(ctx->var_count > 0 ? ctx->var_count : 1, sizeof(char*));
+    int match = 1;
+    
+    for (int i = 0; i < ctx->target_arity; i++) {
+        int var_idx = ctx->arg_to_var[i];
+        if (var_idx == -1) {
+            if (strcmp(ctx->query_args[i], args[i]) != 0) {
+                match = 0; break;
+            }
+        } else {
+            if (bindings[var_idx] == NULL) {
+                bindings[var_idx] = (char *)args[i];
+            } else {
+                if (strcmp(bindings[var_idx], args[i]) != 0) {
+                    match = 0; break;
+                }
+            }
+        }
+    }
+    
+    if (match) {
+        if (ctx->var_count == 0) {
+            ctx->ground_match = 1;
+        } else {
+            if (ctx->row_count >= ctx->row_cap) {
+                ctx->row_cap = ctx->row_cap == 0 ? 8 : ctx->row_cap * 2;
+                ctx->rows = realloc(ctx->rows, sizeof(char**) * ctx->row_cap);
+            }
+            char **row = malloc(sizeof(char*) * ctx->var_count);
+            for (int i = 0; i < ctx->var_count; i++) {
+                row[i] = strdup(bindings[i] ? bindings[i] : "");
+            }
+            ctx->rows[ctx->row_count++] = row;
+        }
+    }
+    
+    free(bindings);
+}
+
 int main(int argc, char **argv) {
     CLIConfig cfg = parse_args(argc, argv);
-    
     if (cfg.show_help || !cfg.filepath) {
         print_usage(argv[0]);
         return cfg.show_help ? 0 : 1;
     }
     
     if (cfg.verbose) {
-        printf("SuperLang compiler v0.1\n");
+        printf("SuperLang compiler v0.9\n");
         printf("Input file: %s\n", cfg.filepath);
     }
     
@@ -138,12 +193,11 @@ int main(int argc, char **argv) {
     }
     
     if (cfg.verbose) {
-        printf("Source size: %ld bytes\n\n", source_size);
+        printf("Source size: %ld bytes\n", source_size);
     }
     
     int result_code = 0;
     
-    /* Initialize all cleanup pointers to NULL early */
     ParseResult parse;
     parse.program = NULL;
     parse.error_message = NULL;
@@ -172,15 +226,13 @@ int main(int argc, char **argv) {
         token_list_free(&tokens);
         return 1;
     }
-    
     if (cfg.verbose) {
         printf("    ✓ %zu tokens\n", tokens.count);
     }
-    
     if (cfg.dump_tokens) {
         printf("\n=== TOKENS ===\n");
         token_list_dump(&tokens);
-        printf("==============\n\n");
+        printf("==============\n");
     }
     
     /* Stage 2: Parser */
@@ -194,7 +246,6 @@ int main(int argc, char **argv) {
         parse_result_free(&parse);
         return 1;
     }
-    
     if (cfg.verbose) {
         printf("    ✓ AST built\n");
         printf("        entities: %d\n", parse.program->entity_count);
@@ -204,22 +255,19 @@ int main(int argc, char **argv) {
         printf("        inputs: %d\n", parse.program->input_count);
         printf("        queries: %d\n", parse.program->query_count);
     }
-    
     if (cfg.dump_ast) {
         printf("\n=== AST ===\n");
         program_dump(parse.program);
-        printf("===========\n\n");
+        printf("===========\n");
     }
     
     /* Stage 2.5: Type checking */
     if (cfg.verbose) printf("[2.5] Type checking...\n");
     TypeCheckResult type_check = typecheck_program(parse.program);
-    
     if (cfg.dump_ast || type_check.count > 0) {
         typecheck_result_dump(&type_check);
         printf("\n");
     }
-    
     if (type_check.count > 0) {
         fprintf(stderr, "\n✗ Compilation stopped: type/existence/safety errors above.\n");
         fprintf(stderr, "  (Use --dump-ast to inspect parsed structure)\n");
@@ -227,29 +275,25 @@ int main(int argc, char **argv) {
         parse_result_free(&parse);
         return 1;
     }
-    
     typecheck_result_free(&type_check);
     
     /* Stage 3: AST → Semantic Graph */
     if (cfg.verbose) printf("[3] Translating to semantic graph...\n");
     trans = ast_to_graph_translate(parse.program);
-    
     if (!trans.is_valid) {
         fprintf(stderr, "✗ Translation FAILED: %s\n", trans.error_message);
         translation_result_free(&trans);
         parse_result_free(&parse);
         return 1;
     }
-    
     if (cfg.verbose) {
         printf("    ✓ %zu nodes, %zu edges\n",
                trans.graph->node_count, trans.graph->edge_count);
     }
-    
     if (cfg.dump_graph) {
         printf("\n=== SEMANTIC GRAPH ===\n");
         graph_dump(trans.graph);
-        printf("======================\n\n");
+        printf("======================\n");
     }
     
     /* Stage 4: Validation */
@@ -277,15 +321,13 @@ int main(int argc, char **argv) {
     /* Stage 5: Synthesize Closure IR */
     if (cfg.verbose) printf("[5] Synthesizing closure operator...\n");
     closure = synthesize(trans.graph);
-    
     if (cfg.verbose) {
         printf("    ✓ %zu rules\n", closure->rule_count);
     }
-    
     if (cfg.dump_ir) {
         printf("\n=== CLOSURE IR ===\n");
         closure_dump(closure);
-        printf("==================\n\n");
+        printf("==================\n");
     }
     
     /* Stage 6: Load input facts */
@@ -297,14 +339,13 @@ int main(int argc, char **argv) {
             case 1: config_add_fact(config, f->predicate, 1, f->args[0]); break;
             case 2: config_add_fact(config, f->predicate, 2, f->args[0], f->args[1]); break;
             case 3: config_add_fact(config, f->predicate, 3, f->args[0], f->args[1], f->args[2]); break;
-            default: 
+            default:
                 if (cfg.verbose) {
                     printf("    (skipping fact with %d args — not supported)\n", f->arg_count);
                 }
                 break;
         }
     }
-    
     if (cfg.verbose) {
         printf("    ✓ Loaded\n");
     }
@@ -313,23 +354,44 @@ int main(int argc, char **argv) {
     if (cfg.verbose) printf("[7] Saturating...\n");
     saturate(config, closure);
     
-    /* Stage 8: Queries */
+    /* Stage 8: Queries (Pattern Matching - v0.7) */
     printf("\n=== QUERY RESULTS ===\n");
     for (int i = 0; i < parse.program->query_count; i++) {
         const Query *q = &parse.program->queries[i];
-        int answer = 0;
         
-        switch (q->arg_count) {
-            case 1:
-                answer = config_has_fact(config, q->predicate, 1, q->args[0]);
-                break;
-            case 2:
-                answer = config_has_fact(config, q->predicate, 2, q->args[0], q->args[1]);
-                break;
-            case 3:
-                answer = config_has_fact(config, q->predicate, 3, q->args[0], q->args[1], q->args[2]);
-                break;
+        int var_count = 0;
+        int *arg_to_var = malloc(sizeof(int) * q->arg_count);
+        char **var_names = NULL;
+        
+        for (int j = 0; j < q->arg_count; j++) {
+            if (is_query_var(q->args[j])) {
+                int found = -1;
+                for (int k = 0; k < var_count; k++) {
+                    if (strcmp(var_names[k], q->args[j]) == 0) {
+                        found = k; break;
+                    }
+                }
+                if (found == -1) {
+                    var_names = realloc(var_names, sizeof(char*) * (var_count + 1));
+                    var_names[var_count] = strdup(q->args[j]);
+                    arg_to_var[j] = var_count;
+                    var_count++;
+                } else {
+                    arg_to_var[j] = found;
+                }
+            } else {
+                arg_to_var[j] = -1;
+            }
         }
+        
+        MatchCtx ctx = {0};
+        ctx.target_pred = q->predicate;
+        ctx.target_arity = q->arg_count;
+        ctx.arg_to_var = arg_to_var;
+        ctx.var_count = var_count;
+        ctx.query_args = (const char **)q->args;
+        
+        config_visit_facts(config, match_visitor, &ctx);
         
         printf("    ?- %s(", q->predicate);
         for (int j = 0; j < q->arg_count; j++) {
@@ -337,10 +399,42 @@ int main(int argc, char **argv) {
             printf("%s", q->args[j]);
         }
         printf(")\n");
-        printf("       → %s\n\n", answer ? "TRUE" : "FALSE");
+        
+        if (var_count == 0) {
+            printf("       → %s\n", ctx.ground_match ? "TRUE" : "FALSE");
+        } else {
+            if (ctx.row_count == 0) {
+                printf("       → []\n");
+            } else {
+                printf("       → [");
+                for (int r = 0; r < ctx.row_count; r++) {
+                    if (r > 0) printf(", ");
+                    if (var_count == 1) {
+                        printf("%s", ctx.rows[r][0]);
+                    } else {
+                        printf("(");
+                        for (int v = 0; v < var_count; v++) {
+                            if (v > 0) printf(", ");
+                            printf("%s", ctx.rows[r][v]);
+                        }
+                        printf(")");
+                    }
+                }
+                printf("]\n");
+            }
+        }
+        
+        for (int r = 0; r < ctx.row_count; r++) {
+            for (int v = 0; v < var_count; v++) free(ctx.rows[r][v]);
+            free(ctx.rows[r]);
+        }
+        free(ctx.rows);
+        for (int j = 0; j < var_count; j++) free(var_names[j]);
+        free(var_names);
+        free(arg_to_var);
     }
     printf("=====================\n");
-
+    
 cleanup:
     if (config) config_free(config);
     if (closure) closure_free(closure);
@@ -348,6 +442,5 @@ cleanup:
     validation_result_free(&sem_val);
     translation_result_free(&trans);
     parse_result_free(&parse);
-    
     return result_code;
 }

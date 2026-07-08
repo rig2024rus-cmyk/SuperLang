@@ -1,0 +1,9 @@
+relation greeting(person, message)
+
+input {
+    greeting(alice, hello)
+    greeting(bob, hi)
+}
+
+query greeting(alice, hello)
+query greeting(alice, !Msg)

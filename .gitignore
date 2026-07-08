@@ -1,21 +1,24 @@
-# Compiled objects
-*.o
-*.obj
-
-# Binary
+# Compiled binary
 superlang
+*.o
 
-# Editor backup files
-*~
-*.bak
+# Editor files
+.vscode/
+.idea/
 *.swp
-
-# Valgrind output
-*.log
-
-# OS files
+*~
 .DS_Store
-Thumbs.db
 
-# Temporary test outputs
-/tmp_test_*
+# Temporary files
+*.tmp
+*.bak
+
+# Archives
+*.tar.gz
+*.zip
+
+# Backup directories
+backup_*/
+
+# Experiments (optional, comment out if you want to commit them)
+# experiments/

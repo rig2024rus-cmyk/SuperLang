@@ -1,218 +1,313 @@
 #include "semantic_validator.h"
-#include <stdio.h>
+#include "graph.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+/* ====================================================================== */
+/* Tarjan's SCC algorithm                                                  */
+/* ====================================================================== */
 
 typedef struct {
-    int index;
-    int lowlink;
-    int on_stack;
-} NodeInfo;
+    int *index;
+    int *lowlink;
+    int *on_stack;
+    int *stack;
+    int stack_top;
+    int current_index;
+    size_t node_count;
+    int **sccs;
+    int *scc_sizes;
+    int scc_count;
+    int scc_capacity;
+} TarjanState;
 
-typedef struct {
-    Node **nodes;
-    int count;
-    int capacity;
-    int has_negative_internal;
-} SCC;
+static TarjanState *tarjan_state_new(size_t node_count) {
+    TarjanState *state = calloc(1, sizeof(TarjanState));
+    if (!state) return NULL;
 
-typedef struct {
-    SCC *items;
-    int count;
-    int capacity;
-} SCCList;
+    state->index = malloc(node_count * sizeof(int));
+    state->lowlink = malloc(node_count * sizeof(int));
+    state->on_stack = calloc(node_count, sizeof(int));
+    state->stack = malloc(node_count * sizeof(int));
+    state->stack_top = 0;
+    state->current_index = 0;
+    state->node_count = node_count;
+    state->sccs = NULL;
+    state->scc_sizes = NULL;
+    state->scc_count = 0;
+    state->scc_capacity = 0;
 
-typedef struct {
-    Node **node_array;
-    int node_count;
-    NodeInfo *info;
-    Node **stack;
-    int stack_size;
-    int index_counter;
-    SCCList *sccs;
-} TarjanCtx;
+    for (size_t i = 0; i < node_count; i++) {
+        state->index[i] = -1;
+        state->lowlink[i] = -1;
+    }
 
-static int node_index(TarjanCtx *ctx, Node *n) {
-    for (int i = 0; i < ctx->node_count; i++) {
-        if (ctx->node_array[i] == n) return i;
+    return state;
+}
+
+static void tarjan_state_free(TarjanState *state) {
+    if (!state) return;
+    free(state->index);
+    free(state->lowlink);
+    free(state->on_stack);
+    free(state->stack);
+    for (int i = 0; i < state->scc_count; i++) {
+        free(state->sccs[i]);
+    }
+    free(state->sccs);
+    free(state->scc_sizes);
+    free(state);
+}
+
+/* Build array of node pointers from linked list for indexed access.
+ * Caller must free the returned array (but not the Nodes it points to). */
+static Node **build_nodes_array(const Graph *g) {
+    Node **arr = malloc(g->node_count * sizeof(Node*));
+    if (!arr) return NULL;
+    size_t i = 0;
+    for (Node *n = g->nodes; n && i < g->node_count; n = n->next) {
+        arr[i++] = n;
+    }
+    return arr;
+}
+
+/* Find index of target node in array. Returns -1 if not found. */
+static int find_node_index(Node **nodes_arr, size_t node_count, const Node *target) {
+    for (size_t i = 0; i < node_count; i++) {
+        if (nodes_arr[i] == target) return (int)i;
     }
     return -1;
 }
 
-static void tarjan_visit(TarjanCtx *ctx, int v_idx) {
-    NodeInfo *vi = &ctx->info[v_idx];
-    vi->index = ctx->index_counter;
-    vi->lowlink = ctx->index_counter;
-    ctx->index_counter++;
-    vi->on_stack = 1;
-    ctx->stack[ctx->stack_size++] = ctx->node_array[v_idx];
+static void tarjan_strongconnect(Node **nodes_arr, size_t node_count,
+                                  int v, TarjanState *state) {
+    state->index[v] = state->current_index;
+    state->lowlink[v] = state->current_index;
+    state->current_index++;
+    state->stack[state->stack_top++] = v;
+    state->on_stack[v] = 1;
 
-    Node *v = ctx->node_array[v_idx];
-    for (Edge *e = v->outgoing; e; e = e->next) {
-        int w_idx = node_index(ctx, e->target);
-        if (w_idx == -1) continue;
-        NodeInfo *wi = &ctx->info[w_idx];
-        if (wi->index == -1) {
-            tarjan_visit(ctx, w_idx);
-            if (wi->lowlink < vi->lowlink) vi->lowlink = wi->lowlink;
-        } else if (wi->on_stack) {
-            if (wi->index < vi->lowlink) vi->lowlink = wi->index;
+    Node *node = nodes_arr[v];
+    for (Edge *e = node->outgoing; e; e = e->next) {
+        /* Only dependency edges form the SCC graph */
+        if (e->type != EDGE_DEFINED_BY_COMPOSITION &&
+            e->type != EDGE_DEFINED_BY_RECURSIVE &&
+            e->type != EDGE_DEFINED_BY_NEGATION &&
+            e->type != EDGE_DEFINED_BY_BASE) {
+            continue;
+        }
+
+        int w = find_node_index(nodes_arr, node_count, e->target);
+        if (w == -1) continue;
+
+        if (state->index[w] == -1) {
+            tarjan_strongconnect(nodes_arr, node_count, w, state);
+            if (state->lowlink[w] < state->lowlink[v]) {
+                state->lowlink[v] = state->lowlink[w];
+            }
+        } else if (state->on_stack[w]) {
+            if (state->index[w] < state->lowlink[v]) {
+                state->lowlink[v] = state->index[w];
+            }
         }
     }
 
-    if (vi->lowlink == vi->index) {
-        if (ctx->sccs->count >= ctx->sccs->capacity) {
-            ctx->sccs->capacity = ctx->sccs->capacity ? ctx->sccs->capacity * 2 : 4;
-            ctx->sccs->items = realloc(ctx->sccs->items, sizeof(SCC) * ctx->sccs->capacity);
+    if (state->lowlink[v] == state->index[v]) {
+        if (state->scc_count >= state->scc_capacity) {
+            state->scc_capacity = state->scc_capacity == 0 ? 8 : state->scc_capacity * 2;
+            state->sccs = realloc(state->sccs, state->scc_capacity * sizeof(int*));
+            state->scc_sizes = realloc(state->scc_sizes, state->scc_capacity * sizeof(int));
         }
-        SCC *scc = &ctx->sccs->items[ctx->sccs->count];
-        scc->nodes = NULL;
-        scc->count = 0;
-        scc->capacity = 0;
-        scc->has_negative_internal = 0;
 
-        Node *w;
+        int *scc = malloc(state->node_count * sizeof(int));
+        int scc_size = 0;
+        int w;
         do {
-            w = ctx->stack[--ctx->stack_size];
-            ctx->info[node_index(ctx, w)].on_stack = 0;
-            if (scc->count >= scc->capacity) {
-                scc->capacity = scc->capacity ? scc->capacity * 2 : 4;
-                scc->nodes = realloc(scc->nodes, sizeof(Node*) * scc->capacity);
-            }
-            scc->nodes[scc->count++] = w;
+            w = state->stack[--state->stack_top];
+            state->on_stack[w] = 0;
+            scc[scc_size++] = w;
         } while (w != v);
 
-        ctx->sccs->count++;
+        state->sccs[state->scc_count] = malloc(scc_size * sizeof(int));
+        memcpy(state->sccs[state->scc_count], scc, scc_size * sizeof(int));
+        state->scc_sizes[state->scc_count] = scc_size;
+        state->scc_count++;
+        free(scc);
     }
 }
 
-static void compute_scc_internal_negation(TarjanCtx *ctx) {
-    for (int s = 0; s < ctx->sccs->count; s++) {
-        SCC *scc = &ctx->sccs->items[s];
-        for (int i = 0; i < scc->count && !scc->has_negative_internal; i++) {
-            Node *n = scc->nodes[i];
-            for (Edge *e = n->outgoing; e; e = e->next) {
+static TarjanState *tarjan_find_sccs(const Graph *g, Node **nodes_arr) {
+    TarjanState *state = tarjan_state_new(g->node_count);
+    if (!state) return NULL;
+
+    for (size_t i = 0; i < g->node_count; i++) {
+        if (state->index[i] == -1) {
+            tarjan_strongconnect(nodes_arr, g->node_count, (int)i, state);
+        }
+    }
+
+    return state;
+}
+
+/* ====================================================================== */
+/* Structural validation                                                   */
+/* ====================================================================== */
+
+ValidationResult graph_validate_structure(const Graph *g) {
+    ValidationResult result;
+    memset(&result, 0, sizeof(result));
+    result.is_valid = 1;
+    result.error_message = NULL;
+
+    if (!g) {
+        result.is_valid = 0;
+        result.error_message = strdup("Graph is NULL");
+        return result;
+    }
+
+    if (g->node_count == 0) {
+        result.is_valid = 0;
+        result.error_message = strdup("Graph has no nodes");
+        return result;
+    }
+
+    /* Iterate linked list of nodes */
+    for (Node *n = g->nodes; n; n = n->next) {
+        if (n->type == NODE_DERIVED && !n->outgoing) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "Derived node '%s' has no definition (no outgoing edges)",
+                     n->name);
+            result.is_valid = 0;
+            result.error_message = strdup(msg);
+            return result;
+        }
+    }
+
+    return result;
+}
+
+/* ====================================================================== */
+/* Semantic validation (stratification check)                              */
+/* ====================================================================== */
+
+ValidationResult graph_validate_semantics(const Graph *g) {
+    ValidationResult result;
+    memset(&result, 0, sizeof(result));
+    result.is_valid = 1;
+    result.error_message = NULL;
+
+    if (!g) {
+        result.is_valid = 0;
+        result.error_message = strdup("Graph is NULL");
+        return result;
+    }
+
+    if (g->node_count == 0) {
+        return result;
+    }
+
+    /* Build indexed array from linked list for Tarjan */
+    Node **nodes_arr = build_nodes_array(g);
+    if (!nodes_arr) {
+        result.is_valid = 0;
+        result.error_message = strdup("Out of memory building node index");
+        return result;
+    }
+
+    TarjanState *state = tarjan_find_sccs(g, nodes_arr);
+    if (!state) {
+        free(nodes_arr);
+        result.is_valid = 0;
+        result.error_message = strdup("Out of memory in Tarjan SCC");
+        return result;
+    }
+
+    for (int i = 0; i < state->scc_count; i++) {
+        int scc_size = state->scc_sizes[i];
+
+        /* Single-node SCC: check for self-negation */
+        if (scc_size == 1) {
+            int node_idx = state->sccs[i][0];
+            Node *node = nodes_arr[node_idx];
+            for (Edge *e = node->outgoing; e; e = e->next) {
+                if (e->type == EDGE_DEFINED_BY_NEGATION && e->target == node) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                             "Self-negation detected in '%s'. "
+                             "Program is not stratifiable.",
+                             node->name);
+                    result.is_valid = 0;
+                    result.error_message = strdup(msg);
+                    tarjan_state_free(state);
+                    free(nodes_arr);
+                    return result;
+                }
+            }
+            continue;
+        }
+
+        /* Multi-node SCC: check for negation edges within */
+        int has_negation = 0;
+        char *neg_source = NULL;
+        char *neg_target = NULL;
+
+        for (int j = 0; j < scc_size && !has_negation; j++) {
+            int node_idx = state->sccs[i][j];
+            Node *node = nodes_arr[node_idx];
+
+            for (Edge *e = node->outgoing; e; e = e->next) {
                 if (e->type != EDGE_DEFINED_BY_NEGATION) continue;
-                for (int j = 0; j < scc->count; j++) {
-                    if (scc->nodes[j] == e->target) {
-                        scc->has_negative_internal = 1;
+
+                /* Check if target is in the same SCC */
+                for (int k = 0; k < scc_size; k++) {
+                    if (nodes_arr[state->sccs[i][k]] == e->target) {
+                        has_negation = 1;
+                        neg_source = node->name;
+                        neg_target = e->target->name;
                         break;
                     }
                 }
-                if (scc->has_negative_internal) break;
+                if (has_negation) break;
             }
         }
-    }
-}
 
-static SCCList *find_sccs(const Graph *g) {
-    TarjanCtx ctx;
-    ctx.node_count = (int)g->node_count;
-    ctx.node_array = malloc(sizeof(Node*) * ctx.node_count);
-    ctx.info = malloc(sizeof(NodeInfo) * ctx.node_count);
-    ctx.stack = malloc(sizeof(Node*) * ctx.node_count);
-    ctx.stack_size = 0;
-    ctx.index_counter = 0;
-
-    int i = 0;
-    for (Node *n = g->nodes; n; n = n->next, i++) {
-        ctx.node_array[i] = n;
-        ctx.info[i].index = -1;
-        ctx.info[i].lowlink = -1;
-        ctx.info[i].on_stack = 0;
-    }
-
-    ctx.sccs = calloc(1, sizeof(SCCList));
-    for (i = 0; i < ctx.node_count; i++) {
-        if (ctx.info[i].index == -1) {
-            tarjan_visit(&ctx, i);
+        if (has_negation) {
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                     "Negative recursion detected in SCC containing '%s' -> '%s' "
+                     "(%d nodes). Program is not stratifiable.",
+                     neg_source, neg_target, scc_size);
+            result.is_valid = 0;
+            result.error_message = strdup(msg);
+            tarjan_state_free(state);
+            free(nodes_arr);
+            return result;
         }
     }
 
-    compute_scc_internal_negation(&ctx);
-
-    free(ctx.node_array);
-    free(ctx.info);
-    free(ctx.stack);
-    return ctx.sccs;
+    tarjan_state_free(state);
+    free(nodes_arr);
+    return result;
 }
 
-static void free_scc_list(SCCList *list) {
-    if (!list) return;
-    for (int i = 0; i < list->count; i++) free(list->items[i].nodes);
-    free(list->items);
-    free(list);
-}
-
-static ValidationResult make_valid(void) {
-    ValidationResult r = {1, NULL, 0};
-    return r;
-}
-
-static ValidationResult make_invalid(const char *msg) {
-    ValidationResult r = {0, strdup(msg), 1};
-    return r;
-}
+/* ====================================================================== */
+/* Result helpers                                                          */
+/* ====================================================================== */
 
 void validation_result_free(ValidationResult *r) {
-    if (r && r->error_message) {
+    if (!r) return;
+    if (r->error_message) {
         free(r->error_message);
         r->error_message = NULL;
     }
 }
 
 void validation_result_dump(const ValidationResult *r) {
-    if (r->is_valid) printf("✓ PASSED\n");
-    else printf("✗ FAILED: %s\n", r->error_message);
-}
-
-ValidationResult graph_validate_structure(const Graph *g) {
-    if (!g) return make_invalid("Graph is NULL");
-    for (Node *n = g->nodes; n; n = n->next) {
-        if (n->type == NODE_DERIVED) {
-            int has_def = 0;
-            for (Edge *e = n->outgoing; e; e = e->next) {
-                if (e->type == EDGE_DEFINED_BY_BASE ||
-                    e->type == EDGE_DEFINED_BY_RECURSIVE ||
-                    e->type == EDGE_DEFINED_BY_COMPOSITION ||
-                    e->type == EDGE_DEFINED_BY_NEGATION ||
-                    e->type == EDGE_DEFINED_BY_AGGREGATE ||
-                    e->type == EDGE_DEFINED_BY_ARITHMETIC) {
-                    has_def = 1; break;
-                }
-            }
-            if (!has_def) {
-                char msg[256];
-                snprintf(msg, sizeof(msg), "Derived node '%s' has no definition", n->name);
-                return make_invalid(msg);
-            }
-        }
+    if (r->is_valid) {
+        printf("PASSED\n");
+    } else {
+        printf("FAILED: %s\n", r->error_message ? r->error_message : "(no message)");
     }
-    return make_valid();
-}
-
-ValidationResult graph_validate_semantics(const Graph *g) {
-    if (!g) return make_invalid("Graph is NULL");
-    SCCList *sccs = find_sccs(g);
-    for (int i = 0; i < sccs->count; i++) {
-        SCC *scc = &sccs->items[i];
-        if (scc->count == 1) {
-            Node *n = scc->nodes[0];
-            int self_loop = 0;
-            for (Edge *e = n->outgoing; e; e = e->next) {
-                if (e->target == n) { self_loop = 1; break; }
-            }
-            if (!self_loop) continue;
-        }
-        if (scc->has_negative_internal) {
-            char msg[512];
-            snprintf(msg, sizeof(msg),
-                "Negative recursion detected in SCC containing '%s'. Program is not stratifiable.",
-                scc->nodes[0]->name);
-            free_scc_list(sccs);
-            return make_invalid(msg);
-        }
-    }
-    free_scc_list(sccs);
-    return make_valid();
 }

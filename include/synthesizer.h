@@ -5,17 +5,17 @@
 
 /* Location of a variable in a body atom */
 typedef struct {
-    int atom_index;      // which body atom (0, 1, 2, ...)
-    int arg_index;       // which argument position in that atom
+    int atom_index;      /* which body atom (0, 1, 2, ...) */
+    int arg_index;       /* which argument position in that atom */
 } ArgLocation;
 
 /* Binding information for a variable */
 typedef struct {
-    char *var_name;                    // variable name (e.g., "being", "greeter")
-    ArgLocation *locations;            // all places where this variable appears
+    char *var_name;                    /* variable name (e.g., "being", "greeter") */
+    ArgLocation *locations;            /* all places where this variable appears */
     int location_count;
-    int is_head;                       // does this variable appear in the head?
-    int head_arg_index;                // if is_head, which position in head args
+    int is_head;                       /* does this variable appear in the head? */
+    int head_arg_index;                /* if is_head, which position in head args */
 } ArgBinding;
 
 typedef struct Rule {
@@ -32,6 +32,10 @@ typedef struct Rule {
     /* Arithmetic */
     Expr **arith_exprs;
     char **arith_result_vars;
+    
+    /* Comparisons (filters) */
+    Comparison **comparisons;
+    int *comparison_counts;
     
     /* Variable bindings for general join */
     ArgBinding *arg_bindings;
