@@ -60,6 +60,44 @@ test-all: superlang
 	fi
 
 valgrind: superlang
-	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./superlang examples/task_ready.unq
+	@echo "====================================="
+	@echo "SuperLang Memory Safety Check"
+	@echo "====================================="
+	@if ! command -v valgrind >/dev/null 2>&1; then \
+		echo "❌ Valgrind not installed. Install with:"; \
+		echo "   sudo apt install valgrind    # Debian/Ubuntu"; \
+		echo "   sudo dnf install valgrind    # Fedora"; \
+		exit 1; \
+	fi
+	@passed=0; failed=0; \
+	for file in examples/hello_world.unq examples/family_tree.unq examples/aggregates_demo.unq tests/test4_ready.unq tests/test1_ancestor.unq; do \
+		if [ ! -f "$$file" ]; then \
+			echo "⚠️  Skipping $$file (not found)"; \
+			continue; \
+		fi; \
+		echo ""; \
+		echo "→ Checking $$file"; \
+		if valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 --quiet ./superlang "$$file" >/dev/null 2>&1; then \
+			echo "  ✓ CLEAN: no leaks, no errors"; \
+			passed=$$((passed + 1)); \
+		else \
+			echo "  ✗ FAILED: memory issues detected"; \
+			valgrind --leak-check=full --show-leak-kinds=all ./superlang "$$file" 2>&1 | tail -20; \
+			failed=$$((failed + 1)); \
+		fi; \
+	done; \
+	echo ""; \
+	echo "====================================="; \
+	echo "Valgrind Summary"; \
+	echo "====================================="; \
+	echo "Passed: $$passed"; \
+	echo "Failed: $$failed"; \
+	echo ""; \
+	if [ "$$failed" = "0" ]; then \
+		echo "✓ ALL MEMORY CHECKS PASSED"; \
+	else \
+		echo "✗ SOME MEMORY CHECKS FAILED"; \
+		exit 1; \
+	fi
 
 .PHONY: clean test-all valgrind

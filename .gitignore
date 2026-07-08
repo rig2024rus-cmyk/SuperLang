@@ -1,6 +1,6 @@
-# Compiled binary
-superlang
+# Build artifacts
 *.o
+superlang
 
 # Editor files
 .vscode/
@@ -12,13 +12,5 @@ superlang
 # Temporary files
 *.tmp
 *.bak
-
-# Archives
 *.tar.gz
-*.zip
-
-# Backup directories
 backup_*/
-
-# Experiments (optional, comment out if you want to commit them)
-# experiments/
