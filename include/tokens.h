@@ -46,6 +46,7 @@ typedef enum {
     TOK_MINUS,      /* - */
     TOK_STAR,       /* * */
     TOK_SLASH,      /* / */
+    TOK_MODULO,     /* % */
     
     /* Special */
     TOK_EOF

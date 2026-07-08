@@ -3,14 +3,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ====================================================================== */
-/* Helpers                                                                */
-/* ====================================================================== */
-
 typedef struct {
     const char *name;
     int arity;
-    int is_derived;  /* 1 = derived/observe, 0 = base relation */
+    int is_derived;
 } PredInfo;
 
 typedef struct {
@@ -26,7 +22,6 @@ static void pred_table_init(PredTable *t) {
 }
 
 static void pred_table_add(PredTable *t, const char *name, int arity, int is_derived) {
-    /* Don't add duplicates */
     for (int i = 0; i < t->count; i++) {
         if (strcmp(t->items[i].name, name) == 0) return;
     }
@@ -53,10 +48,6 @@ static void pred_table_free(PredTable *t) {
     t->count = 0;
     t->capacity = 0;
 }
-
-/* ====================================================================== */
-/* TypeCheckResult                                                        */
-/* ====================================================================== */
 
 static void result_add(TypeCheckResult *r, const char *message,
                        int line, int column, const char *hint) {
@@ -88,31 +79,22 @@ void typecheck_result_dump(const TypeCheckResult *result) {
         printf("✓ TypeCheck: PASSED (0 errors)\n");
         return;
     }
-    
     printf("✗ TypeCheck: FAILED (%d error%s)\n",
            result->count, result->count > 1 ? "s" : "");
-    
     for (int i = 0; i < result->count; i++) {
         const TypeError *e = &result->errors[i];
-        printf("\n  [%d] %d:%d: %s\n", i + 1, e->line, e->column, e->message);
+        printf("\n[%d] %d:%d: %s\n", i + 1, e->line, e->column, e->message);
         if (e->hint) {
             printf("      hint: %s\n", e->hint);
         }
     }
 }
 
-/* ====================================================================== */
-/* Simple Levenshtein edit distance (for "Did you mean?" suggestions)    */
-/* ====================================================================== */
-
 static int levenshtein(const char *a, const char *b) {
     size_t la = strlen(a), lb = strlen(b);
-    
     int *prev = calloc(lb + 1, sizeof(int));
     int *curr = calloc(lb + 1, sizeof(int));
-    
     for (size_t j = 0; j <= lb; j++) prev[j] = (int)j;
-    
     for (size_t i = 1; i <= la; i++) {
         curr[0] = (int)i;
         for (size_t j = 1; j <= lb; j++) {
@@ -129,7 +111,6 @@ static int levenshtein(const char *a, const char *b) {
         prev = curr;
         curr = tmp;
     }
-    
     int result = prev[lb];
     free(prev);
     free(curr);
@@ -139,7 +120,6 @@ static int levenshtein(const char *a, const char *b) {
 static const char *find_closest_predicate(const PredTable *t, const char *name) {
     const char *best = NULL;
     int best_dist = 1000;
-    
     for (int i = 0; i < t->count; i++) {
         int d = levenshtein(name, t->items[i].name);
         if (d < best_dist && d <= 3) {
@@ -149,10 +129,6 @@ static const char *find_closest_predicate(const PredTable *t, const char *name) 
     }
     return best;
 }
-
-/* ====================================================================== */
-/* Safety: track which variables are bound                                */
-/* ====================================================================== */
 
 typedef struct {
     char **names;
@@ -192,13 +168,28 @@ static void var_set_free(VarSet *s) {
     s->capacity = 0;
 }
 
-/* ====================================================================== */
-/* Check a condition: arity, existence, safety                           */
-/* ====================================================================== */
+/* Collect variables from expression (v0.8) */
+static void collect_expr_vars(const Expr *e, VarSet *vars) {
+    if (!e) return;
+    switch (e->type) {
+        case EXPR_NUMBER:
+            break;
+        case EXPR_VARIABLE:
+            var_set_add(vars, e->var_name);
+            break;
+        case EXPR_BINARY:
+            collect_expr_vars(e->binary.left, vars);
+            collect_expr_vars(e->binary.right, vars);
+            break;
+        case EXPR_UNARY_MINUS:
+            collect_expr_vars(e->operand, vars);
+            break;
+    }
+}
 
 static void check_condition(const Condition *cond, const PredTable *preds,
                             VarSet *bound_vars, TypeCheckResult *result) {
-    /* First pass: bind variables from positive atoms, check arity/existence */
+    /* Pass 1: bind variables from positive atoms */
     for (int i = 0; i < cond->atom_count; i++) {
         const Atom *a = &cond->atoms[i];
         if (a->negated) continue;
@@ -206,7 +197,6 @@ static void check_condition(const Condition *cond, const PredTable *preds,
         if (a->aggregate_func) {
             const char *source_pred = a->predicate;
             int source_arity = a->arg_count - 1;
-            
             const PredInfo *info = pred_table_find(preds, source_pred);
             if (!info) {
                 char msg[256];
@@ -227,7 +217,6 @@ static void check_condition(const Condition *cond, const PredTable *preds,
                          source_pred, info->arity, source_arity);
                 result_add(result, msg, a->loc.line, a->loc.column, NULL);
             }
-            
             var_set_add(bound_vars, a->args[0]);
             for (int j = 1; j < a->arg_count; j++) {
                 var_set_add(bound_vars, a->args[j]);
@@ -239,7 +228,6 @@ static void check_condition(const Condition *cond, const PredTable *preds,
         if (!info) {
             char msg[256];
             snprintf(msg, sizeof(msg), "Unknown predicate '%s'", a->predicate);
-            
             const char *suggestion = find_closest_predicate(preds, a->predicate);
             char *hint = NULL;
             if (suggestion) {
@@ -247,7 +235,6 @@ static void check_condition(const Condition *cond, const PredTable *preds,
                 snprintf(buf, sizeof(buf), "Did you mean '%s'?", suggestion);
                 hint = strdup(buf);
             }
-            
             result_add(result, msg, a->loc.line, a->loc.column, hint);
             if (hint) free(hint);
         } else if (info->arity != a->arg_count) {
@@ -263,7 +250,7 @@ static void check_condition(const Condition *cond, const PredTable *preds,
         }
     }
     
-    /* Second pass: check negated atoms */
+    /* Pass 2: check negated atoms */
     for (int i = 0; i < cond->atom_count; i++) {
         const Atom *a = &cond->atoms[i];
         if (!a->negated) continue;
@@ -305,16 +292,37 @@ static void check_condition(const Condition *cond, const PredTable *preds,
         }
     }
     
-    /* Third pass: bind variables from arithmetic assignments */
+    /* Pass 3: bind variables from arithmetic assignments */
     for (int i = 0; i < cond->arith_count; i++) {
         const ArithAssignment *a = &cond->arith_assigns[i];
         var_set_add(bound_vars, a->result_var);
     }
+    
+    /* Pass 4: check comparisons (v0.8) */
+    for (int i = 0; i < cond->comparison_count; i++) {
+        const Comparison *cmp = &cond->comparisons[i];
+        VarSet cmp_vars;
+        var_set_init(&cmp_vars);
+        collect_expr_vars(cmp->left, &cmp_vars);
+        collect_expr_vars(cmp->right, &cmp_vars);
+        
+        for (int j = 0; j < cmp_vars.count; j++) {
+            if (!var_set_contains(bound_vars, cmp_vars.names[j])) {
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                         "Safety violation: variable '%s' used in comparison "
+                         "but not bound by any positive atom or arithmetic assignment",
+                         cmp_vars.names[j]);
+                char *hint = strdup(
+                    "Add a positive atom or arithmetic assignment that binds this variable"
+                );
+                result_add(result, msg, cmp->loc.line, cmp->loc.column, hint);
+                free(hint);
+            }
+        }
+        var_set_free(&cmp_vars);
+    }
 }
-
-/* ====================================================================== */
-/* Main checker                                                           */
-/* ====================================================================== */
 
 TypeCheckResult typecheck_program(const Program *program) {
     TypeCheckResult result;
@@ -327,17 +335,14 @@ TypeCheckResult typecheck_program(const Program *program) {
         return result;
     }
     
-    /* Build predicate table */
     PredTable preds;
     pred_table_init(&preds);
     
-    /* Entities automatically create base predicates with arity 1 */
     for (int i = 0; i < program->entity_count; i++) {
         const EntityDecl *e = &program->entities[i];
         pred_table_add(&preds, e->name, 1, 0);
     }
     
-    /* Explicit relations */
     for (int i = 0; i < program->relation_count; i++) {
         const RelationDecl *r = &program->relations[i];
         pred_table_add(&preds, r->name, r->param_count, 0);
@@ -353,15 +358,11 @@ TypeCheckResult typecheck_program(const Program *program) {
         pred_table_add(&preds, o->name, o->param_count, 1);
     }
     
-    /* Check observe declarations */
     for (int i = 0; i < program->observe_count; i++) {
         const ObserveDecl *o = &program->observes[i];
         VarSet bound;
         var_set_init(&bound);
-        
         check_condition(&o->condition, &preds, &bound, &result);
-        
-        /* All head params must be bound in body */
         for (int j = 0; j < o->param_count; j++) {
             if (!var_set_contains(&bound, o->params[j])) {
                 char msg[256];
@@ -372,19 +373,14 @@ TypeCheckResult typecheck_program(const Program *program) {
                 result_add(&result, msg, o->loc.line, o->loc.column, NULL);
             }
         }
-        
         var_set_free(&bound);
     }
     
-    /* Check derive declarations */
     for (int i = 0; i < program->derive_count; i++) {
         const DeriveDecl *d = &program->derives[i];
         VarSet bound;
         var_set_init(&bound);
-        
         check_condition(&d->condition, &preds, &bound, &result);
-        
-        /* All head params must be bound in body */
         for (int j = 0; j < d->param_count; j++) {
             if (!var_set_contains(&bound, d->params[j])) {
                 char msg[256];
@@ -395,15 +391,12 @@ TypeCheckResult typecheck_program(const Program *program) {
                 result_add(&result, msg, d->loc.line, d->loc.column, NULL);
             }
         }
-        
         var_set_free(&bound);
     }
     
-    /* Check input facts: predicates must be base (relations), arity match */
     for (int i = 0; i < program->input_count; i++) {
         const InputFact *f = &program->inputs[i];
         const PredInfo *info = pred_table_find(&preds, f->predicate);
-        
         if (!info) {
             char msg[256];
             snprintf(msg, sizeof(msg),
@@ -434,11 +427,10 @@ TypeCheckResult typecheck_program(const Program *program) {
         }
     }
     
-    /* Check queries: predicates must exist */
+    /* Check queries with arity validation (v0.7) */
     for (int i = 0; i < program->query_count; i++) {
         const Query *q = &program->queries[i];
         const PredInfo *info = pred_table_find(&preds, q->predicate);
-        
         if (!info) {
             char msg[256];
             snprintf(msg, sizeof(msg),
@@ -452,6 +444,13 @@ TypeCheckResult typecheck_program(const Program *program) {
             }
             result_add(&result, msg, q->loc.line, q->loc.column, hint);
             if (hint) free(hint);
+        } else if (info->arity != q->arg_count) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "Arity mismatch in query: '%s' declared with arity %d, "
+                     "query has %d args",
+                     q->predicate, info->arity, q->arg_count);
+            result_add(&result, msg, q->loc.line, q->loc.column, NULL);
         }
     }
     

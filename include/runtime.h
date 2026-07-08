@@ -32,4 +32,8 @@ void saturate(Config *c, const ClosureIR *closure);
 /* Output */
 void config_dump(const Config *c);
 
+/* Pattern Matching Support */
+typedef void (*FactVisitor)(const char *pred, int arity, const char **args, void *ctx);
+void config_visit_facts(Config *c, FactVisitor visitor, void *ctx);
+
 #endif

@@ -46,7 +46,6 @@ void config_add_fact(Config *c, const char *pred, int arity, ...) {
             }
         }
     }
-
     Fact *f = calloc(1, sizeof(Fact));
     f->predicate = strdup(pred);
     f->args = new_args;
@@ -93,7 +92,6 @@ static int fact_exists(Config *c, const char *pred, int arity, char **args) {
 
 static void add_fact_direct(Config *c, const char *pred, int arity, char **args) {
     if (fact_exists(c, pred, arity, args)) return;
-
     Fact *f = calloc(1, sizeof(Fact));
     f->predicate = strdup(pred);
     f->arity = arity;
@@ -112,6 +110,13 @@ void config_dump(const Config *c) {
             printf("%s%s", f->args[i], i < f->arity - 1 ? ", " : "");
         }
         printf(")\n");
+    }
+}
+
+void config_visit_facts(Config *c, FactVisitor visitor, void *ctx) {
+    if (!c || !visitor) return;
+    for (Fact *f = c->facts; f; f = f->next) {
+        visitor(f->predicate, f->arity, (const char **)f->args, ctx);
     }
 }
 
@@ -143,6 +148,10 @@ static double eval_expr(const Expr *e, const VarBindings *binds) {
                 case '-': return left - right;
                 case '*': return left * right;
                 case '/': return (right == 0.0) ? 0.0 : left / right;
+                case '%': {
+                    if (right == 0.0) return 0.0;
+                    return fmod(left, right);
+                }
             }
             return 0.0;
         }
@@ -152,6 +161,25 @@ static double eval_expr(const Expr *e, const VarBindings *binds) {
     return 0.0;
 }
 
+static int eval_comparisons(const Comparison *cmps, int count, const VarBindings *binds) {
+    for (int i = 0; i < count; i++) {
+        const Comparison *cmp = &cmps[i];
+        double left = eval_expr(cmp->left, binds);
+        double right = eval_expr(cmp->right, binds);
+        int result = 0;
+        switch (cmp->op) {
+            case CMP_EQ: result = (left == right); break;
+            case CMP_NE: result = (left != right); break;
+            case CMP_LT: result = (left < right); break;
+            case CMP_LE: result = (left <= right); break;
+            case CMP_GT: result = (left > right); break;
+            case CMP_GE: result = (left >= right); break;
+        }
+        if (!result) return 0;
+    }
+    return 1;
+}
+
 static int apply_rule_aggregate(Config *c, const Rule *r) {
     int added = 0;
     char *agg_func = r->aggregate_funcs[0];
@@ -159,7 +187,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
     int src_arity = r->body_arities[0];
     int dst_arity = r->head_arity;
     int needs_numeric = (strcmp(agg_func, "count") != 0);
-    
+
     typedef struct {
         char **key;
         int key_count;
@@ -168,28 +196,28 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
         double min, max;
         int initialized;
     } Group;
-    
+
     Group *groups = NULL;
     int group_count = 0, group_capacity = 0;
-    
+
     for (Fact *f = c->facts; f; f = f->next) {
         if (strcmp(f->predicate, r->body_preds[0]) != 0) continue;
         if (f->arity != src_arity) continue;
-        
+
         int key_count = src_arity - 1;
         char **key = malloc(sizeof(char*) * key_count);
         int ki = 0;
         for (int i = 0; i < src_arity; i++) {
             if (i != agg_field) key[ki++] = f->args[i];
         }
-        
+
         double value = 0.0;
         if (needs_numeric) {
             char *endptr;
             value = strtod(f->args[agg_field], &endptr);
             if (*endptr != '\0') { free(key); continue; }
         }
-        
+
         Group *g = NULL;
         for (int i = 0; i < group_count; i++) {
             int match = 1;
@@ -198,7 +226,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
             }
             if (match) { g = &groups[i]; free(key); break; }
         }
-        
+
         if (!g) {
             if (group_count >= group_capacity) {
                 group_capacity = group_capacity == 0 ? 16 : group_capacity * 2;
@@ -211,7 +239,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
             g->min = 0; g->max = 0;
             g->initialized = 0;
         }
-        
+
         if (strcmp(agg_func, "count") == 0) {
             g->count++;
         } else {
@@ -226,7 +254,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
             }
         }
     }
-    
+
     for (int i = 0; i < group_count; i++) {
         Group *g = &groups[i];
         double result;
@@ -235,22 +263,22 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
         else if (strcmp(agg_func, "min") == 0) result = g->initialized ? g->min : 0;
         else if (strcmp(agg_func, "max") == 0) result = g->initialized ? g->max : 0;
         else { free(g->key); continue; }
-        
+
         char **args = malloc(sizeof(char*) * dst_arity);
         int ai = 0;
         for (int j = 0; j < g->key_count; j++) args[ai++] = g->key[j];
+
         char buf[64];
         if (result == (int)result && fabs(result) < 1e15)
             snprintf(buf, sizeof(buf), "%d", (int)result);
         else
             snprintf(buf, sizeof(buf), "%.2f", result);
         args[ai] = buf;
-        
+
         if (!fact_exists(c, r->head, dst_arity, args)) {
             add_fact_direct(c, r->head, dst_arity, args);
             added++;
         }
-        
         free(args);
         free(g->key);
     }
@@ -266,7 +294,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
             regular_slots[regular_count++] = i;
     }
     if (regular_count == 0) return added;
-    
+
     Fact **fact_lists[16];
     int fact_counts[16];
     for (int s = 0; s < regular_count; s++) {
@@ -284,26 +312,26 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
             fact_lists[s][fact_counts[s]++] = f;
         }
     }
-    
+
     int atom_to_pos[32];
     for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
     for (int s = 0; s < regular_count; s++) atom_to_pos[regular_slots[s]] = s;
-    
+
     int indices[16] = {0};
     while (1) {
         int valid = 1;
         for (int s = 0; s < regular_count; s++)
             if (indices[s] >= fact_counts[s]) { valid = 0; break; }
         if (!valid) break;
-        
+
         Fact *current_facts[16];
         for (int s = 0; s < regular_count; s++)
             current_facts[s] = fact_lists[s][indices[s]];
-        
+
         int combination_valid = 1;
         char **binding_values = r->arg_binding_count > 0
             ? malloc(sizeof(char*) * r->arg_binding_count) : NULL;
-        
+
         for (int b = 0; b < r->arg_binding_count && combination_valid; b++) {
             ArgBinding *bind = &r->arg_bindings[b];
             if (bind->location_count == 0) { binding_values[b] = NULL; continue; }
@@ -320,7 +348,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
                 }
             }
         }
-        
+
         if (combination_valid) {
             const char **bind_names = malloc(sizeof(const char*) * r->arg_binding_count);
             const char **bind_values_arr = malloc(sizeof(const char*) * r->arg_binding_count);
@@ -332,49 +360,64 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
                 bind_count++;
             }
             VarBindings vbinds = { bind_names, bind_values_arr, bind_count };
-            double val = eval_expr(r->arith_exprs[arith_slot], &vbinds);
-            
-            char **result_args = malloc(sizeof(char*) * r->head_arity);
-            int head_valid = 1;
-            for (int j = 0; j < r->head_arity; j++) {
-                int found = -1;
-                for (int b = 0; b < r->arg_binding_count; b++) {
-                    if (r->arg_bindings[b].is_head && r->arg_bindings[b].head_arg_index == j) {
-                        found = b; break;
+
+            /* Проверка фильтров сравнения */
+            if (r->comparisons && r->comparisons[arith_slot] && r->comparison_counts[arith_slot] > 0) {
+                if (!eval_comparisons(r->comparisons[arith_slot], r->comparison_counts[arith_slot], &vbinds)) {
+                    free(bind_names);
+                    free(bind_values_arr);
+                    free(binding_values);
+                    combination_valid = 0;
+                }
+            }
+
+            if (combination_valid) {
+                double val = eval_expr(r->arith_exprs[arith_slot], &vbinds);
+
+                char **result_args = calloc(r->head_arity, sizeof(char*));
+                int *is_our_alloc = calloc(r->head_arity, sizeof(int));
+                int head_valid = 1;
+
+                for (int j = 0; j < r->head_arity; j++) {
+                    int found = -1;
+                    for (int b = 0; b < r->arg_binding_count; b++) {
+                        if (r->arg_bindings[b].is_head && r->arg_bindings[b].head_arg_index == j) {
+                            found = b; break;
+                        }
+                    }
+                    if (found < 0 || binding_values[found] == NULL) {
+                        if (j == r->head_arity - 1) {
+                            char buf[64];
+                            if (val == (int)val && fabs(val) < 1e15)
+                                snprintf(buf, sizeof(buf), "%d", (int)val);
+                            else
+                                snprintf(buf, sizeof(buf), "%.2f", val);
+                            result_args[j] = strdup(buf);
+                            is_our_alloc[j] = 1;
+                        } else { head_valid = 0; break; }
+                    } else {
+                        result_args[j] = binding_values[found];
+                        is_our_alloc[j] = 0;
                     }
                 }
-                if (found < 0 || binding_values[found] == NULL) {
-                    if (j == r->head_arity - 1) {
-                        char buf[64];
-                        if (val == (int)val && fabs(val) < 1e15)
-                            snprintf(buf, sizeof(buf), "%d", (int)val);
-                        else
-                            snprintf(buf, sizeof(buf), "%.2f", val);
-                        result_args[j] = strdup(buf);
-                    } else { head_valid = 0; break; }
-                } else {
-                    result_args[j] = binding_values[found];
+
+                if (head_valid && !fact_exists(c, r->head, r->head_arity, result_args)) {
+                    add_fact_direct(c, r->head, r->head_arity, result_args);
+                    added++;
                 }
+
+                for (int j = 0; j < r->head_arity; j++) {
+                    if (is_our_alloc[j]) free(result_args[j]);
+                }
+                free(result_args);
+                free(is_our_alloc);
             }
-            
-            if (head_valid && !fact_exists(c, r->head, r->head_arity, result_args)) {
-                char **final_args = malloc(sizeof(char*) * r->head_arity);
-                for (int j = 0; j < r->head_arity; j++) final_args[j] = strdup(result_args[j]);
-                add_fact_direct(c, r->head, r->head_arity, final_args);
-                added++;
-                for (int j = 0; j < r->head_arity; j++) free(final_args[j]);
-                free(final_args);
-            }
-            
-            for (int j = 0; j < r->head_arity; j++)
-                if (j == r->head_arity - 1) free(result_args[j]);
-            free(result_args);
             free(bind_names);
             free(bind_values_arr);
         }
-        
+
         if (binding_values) free(binding_values);
-        
+
         int carry = 1;
         for (int s = regular_count - 1; s >= 0 && carry; s--) {
             indices[s]++;
@@ -383,13 +426,14 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
         }
         if (carry) break;
     }
-    
+
     for (int s = 0; s < regular_count; s++) free(fact_lists[s]);
     return added;
 }
 
 static int apply_rule_general(Config *c, const Rule *r) {
     if (r->body_count == 0) return 0;
+
     int pos_indices[32], neg_indices[32];
     int pos_count = 0, neg_count = 0;
     for (int i = 0; i < r->body_count; i++) {
@@ -397,7 +441,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
         else pos_indices[pos_count++] = i;
     }
     if (pos_count == 0) return 0;
-    
+
     Fact ***pos_fact_lists = malloc(sizeof(Fact**) * pos_count);
     int *pos_fact_counts = calloc(pos_count, sizeof(int));
     for (int p = 0; p < pos_count; p++) {
@@ -420,26 +464,26 @@ static int apply_rule_general(Config *c, const Rule *r) {
             return 0;
         }
     }
-    
+
     int atom_to_pos[32];
     for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
     for (int p = 0; p < pos_count; p++) atom_to_pos[pos_indices[p]] = p;
-    
+
     int *indices = calloc(pos_count, sizeof(int));
     int added = 0;
     char **binding_values = r->arg_binding_count > 0
         ? malloc(sizeof(char*) * r->arg_binding_count) : NULL;
-    
+
     while (1) {
         int valid_indices = 1;
         for (int p = 0; p < pos_count; p++)
             if (indices[p] >= pos_fact_counts[p]) { valid_indices = 0; break; }
         if (!valid_indices) break;
-        
+
         Fact *current_facts[32];
         for (int p = 0; p < pos_count; p++)
             current_facts[p] = pos_fact_lists[p][indices[p]];
-        
+
         int combination_valid = 1;
         for (int b = 0; b < r->arg_binding_count; b++) {
             ArgBinding *bind = &r->arg_bindings[b];
@@ -464,7 +508,31 @@ static int apply_rule_general(Config *c, const Rule *r) {
             }
             if (!combination_valid) break;
         }
-        
+
+        /* Проверка фильтров сравнения */
+        if (combination_valid && r->comparisons && r->comparison_counts) {
+            const char **bind_names = malloc(sizeof(const char*) * r->arg_binding_count);
+            const char **bind_values_arr = malloc(sizeof(const char*) * r->arg_binding_count);
+            int bind_count = 0;
+            for (int b = 0; b < r->arg_binding_count; b++) {
+                if (binding_values[b] == NULL) continue;
+                bind_names[bind_count] = r->arg_bindings[b].var_name;
+                bind_values_arr[bind_count] = binding_values[b];
+                bind_count++;
+            }
+            VarBindings vbinds = { bind_names, bind_values_arr, bind_count };
+
+            for (int i = 0; i < r->body_count && combination_valid; i++) {
+                if (r->comparisons[i] && r->comparison_counts[i] > 0) {
+                    if (!eval_comparisons(r->comparisons[i], r->comparison_counts[i], &vbinds)) {
+                        combination_valid = 0;
+                    }
+                }
+            }
+            free(bind_names);
+            free(bind_values_arr);
+        }
+
         if (combination_valid) {
             for (int n = 0; n < neg_count && combination_valid; n++) {
                 int atom_idx = neg_indices[n];
@@ -491,7 +559,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
                     combination_valid = 0;
             }
         }
-        
+
         if (combination_valid && r->head_arity > 0) {
             char *head_args[32];
             int head_valid = 1;
@@ -510,7 +578,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
                 added++;
             }
         }
-        
+
         int carry = 1;
         for (int p = pos_count - 1; p >= 0 && carry; p--) {
             indices[p]++;
@@ -519,7 +587,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
         }
         if (carry) break;
     }
-    
+
     if (binding_values) free(binding_values);
     free(indices);
     for (int p = 0; p < pos_count; p++)
@@ -539,11 +607,6 @@ static int apply_rule(Config *c, const Rule *r) {
     return apply_rule_general(c, r);
 }
 
-/* ====================================================================== */
-/* Stratification с canonical head + visited set для cycle detection       */
-/* ====================================================================== */
-
-/* Strip _impl_N suffix to get canonical head name */
 static char *strip_impl_suffix(const char *name) {
     const char *impl = strstr(name, "_impl_");
     if (impl) {
@@ -597,13 +660,12 @@ static int rule_strat_fixed(const Rule *r, const ClosureIR *c,
     int max_strat = 0;
     for (int i = 0; i < r->body_count; i++) {
         if (strcmp(r->body_preds[i], "__arith__") == 0) continue;
-        
-        /* Direct self-reference (shouldn't happen with new architecture, but safe) */
+
         char *body_canonical = strip_impl_suffix(r->body_preds[i]);
         int is_self_ref = (strcmp(body_canonical, canonical_head) == 0);
         free(body_canonical);
         if (is_self_ref) continue;
-        
+
         int body_strat = pred_strat_internal(r->body_preds[i], c, canonical_head, visited);
         int required = r->body_negative[i] ? (body_strat + 1) : body_strat;
         if (required > max_strat) max_strat = required;
@@ -613,26 +675,20 @@ static int rule_strat_fixed(const Rule *r, const ClosureIR *c,
 
 static int pred_strat_internal(const char *pred, const ClosureIR *c,
                                const char *canonical_head, VisitedSet *visited) {
-    /* Cycle detection: if we've seen this predicate in current recursion path,
-     * it's in the same SCC → same stratum → return 0 */
     if (visited_contains(visited, pred)) return 0;
-    
-    /* Check if this pred's canonical form equals our head's canonical form */
+
     char *pred_canonical = strip_impl_suffix(pred);
     int same_canonical = (strcmp(pred_canonical, canonical_head) == 0);
     free(pred_canonical);
     if (same_canonical) return 0;
-    
-    /* Check if base predicate (no rules define it) */
+
     int is_base = 1;
     for (Rule *r = c->rules; r; r = r->next) {
         if (strcmp(r->head, pred) == 0) { is_base = 0; break; }
     }
     if (is_base) return 0;
-    
-    /* Add to visited set (backtracking) */
+
     visited_add(visited, pred);
-    
     int max_strat = 0;
     for (Rule *r = c->rules; r; r = r->next) {
         if (strcmp(r->head, pred) == 0) {
@@ -640,16 +696,12 @@ static int pred_strat_internal(const char *pred, const ClosureIR *c,
             if (r_strat > max_strat) max_strat = r_strat;
         }
     }
-    
-    /* Backtrack: remove from visited */
     visited_remove_last(visited);
-    
     return max_strat;
 }
 
 void saturate(Config *c, const ClosureIR *closure) {
     printf("\n[Saturation]\n");
-
     int *strats = malloc(closure->rule_count * sizeof(int));
     int max_strat = 0;
     int i = 0;
@@ -663,15 +715,12 @@ void saturate(Config *c, const ClosureIR *closure) {
         if (strats[i] > max_strat) max_strat = strats[i];
         i++;
     }
-
     printf("  Stratification: %d levels (0 to %d)\n", max_strat + 1, max_strat);
 
     int total_added = 0;
-
     for (int s = 0; s <= max_strat; s++) {
         printf("  Strat %d:\n", s);
         int iteration = 0;
-        
         while (1) {
             iteration++;
             int added_this_round = 0;
@@ -688,11 +737,10 @@ void saturate(Config *c, const ClosureIR *closure) {
             }
         }
     }
-
     printf("  Total facts added: %d\n", total_added);
     free(strats);
 
-    printf("\n  [Diagnostic] Facts by predicate:\n");
+    printf("\n[Diagnostic] Facts by predicate:\n");
     for (Fact *f = c->facts; f; f = f->next) {
         int count = 0;
         for (Fact *f2 = c->facts; f2; f2 = f2->next)

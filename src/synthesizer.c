@@ -3,10 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ====================================================================== */
-/* Expression deep copy                                                    */
-/* ====================================================================== */
-
+/* Deep copy expression */
 static Expr *copy_expr(const Expr *e) {
     if (!e) return NULL;
     switch (e->type) {
@@ -23,6 +20,31 @@ static Expr *copy_expr(const Expr *e) {
             return expr_new_unary_minus(copy_expr(e->operand), e->loc);
     }
     return NULL;
+}
+
+/* Deep copy comparisons (v0.8) */
+static Comparison *copy_comparisons(const Comparison *src, int count, int *out_count) {
+    if (count == 0) {
+        *out_count = 0;
+        return NULL;
+    }
+    Comparison *dst = malloc(sizeof(Comparison) * count);
+    for (int i = 0; i < count; i++) {
+        dst[i].left = copy_expr(src[i].left);
+        dst[i].op = src[i].op;
+        dst[i].right = copy_expr(src[i].right);
+        dst[i].loc = src[i].loc;
+    }
+    *out_count = count;
+    return dst;
+}
+
+static void free_comparisons(Comparison *cmps, int count) {
+    if (!cmps) return;
+    for (int i = 0; i < count; i++) {
+        comparison_free(&cmps[i]);
+    }
+    free(cmps);
 }
 
 /* ====================================================================== */
@@ -47,24 +69,21 @@ static int binding_table_find_or_create(BindingTable *t, const char *var_name) {
             return i;
         }
     }
-    
     if (t->count >= t->capacity) {
         t->capacity = t->capacity == 0 ? 8 : t->capacity * 2;
         t->bindings = realloc(t->bindings, sizeof(ArgBinding) * t->capacity);
     }
-    
     ArgBinding *b = &t->bindings[t->count];
     b->var_name = strdup(var_name);
     b->locations = NULL;
     b->location_count = 0;
     b->is_head = 0;
     b->head_arg_index = -1;
-    
     return t->count++;
 }
 
-static void binding_table_add_location(BindingTable *t, int binding_idx, 
-                                       int atom_index, int arg_index) {
+static void binding_table_add_location(BindingTable *t, int binding_idx,
+                                        int atom_index, int arg_index) {
     ArgBinding *b = &t->bindings[binding_idx];
     b->location_count++;
     b->locations = realloc(b->locations, sizeof(ArgLocation) * b->location_count);
@@ -106,19 +125,14 @@ static void add_rule_to_closure(ClosureIR *closure, Rule *r) {
 static void build_bindings_for_edge(Rule *r, Edge *e, Node *n) {
     BindingTable bt;
     binding_table_init(&bt);
-    
-    /* Add bindings from the single body edge */
     for (int j = 0; j < e->var_binding_count; j++) {
         const char *var = e->var_bindings[j].var_name;
         int bidx = binding_table_find_or_create(&bt, var);
         binding_table_add_location(&bt, bidx, 0, e->var_bindings[j].arg_index);
     }
-    
-    /* Mark head params */
     if (n->head_params && n->head_param_count > 0) {
         binding_table_mark_head(&bt, n->head_params, n->head_param_count);
     }
-    
     r->arg_bindings = bt.bindings;
     r->arg_binding_count = bt.count;
 }
@@ -150,12 +164,22 @@ void rule_free(Rule *r) {
     if (r->arith_exprs) free(r->arith_exprs);
     if (r->arith_result_vars) free(r->arith_result_vars);
     
+    /* Освобождение comparisons (v0.8) */
+    if (r->comparisons) {
+        for (int i = 0; i < r->body_count; i++) {
+            if (r->comparisons[i]) {
+                free_comparisons(r->comparisons[i], r->comparison_counts[i]);
+            }
+        }
+        free(r->comparisons);
+    }
+    if (r->comparison_counts) free(r->comparison_counts);
+    
     for (int i = 0; i < r->arg_binding_count; i++) {
         free(r->arg_bindings[i].var_name);
         free(r->arg_bindings[i].locations);
     }
     free(r->arg_bindings);
-    
     free(r);
 }
 
@@ -173,7 +197,7 @@ void closure_free(ClosureIR *c) {
 void closure_dump(const ClosureIR *c) {
     printf("\n=== Synthesized Closure IR ===\n");
     printf("Rule count: %zu\n", c->rule_count);
-    printf("Lambda: %zu\n\n", c->lambda_count);
+    printf("Lambda: %zu\n", c->lambda_count);
     printf("Rules:\n");
     for (Rule *r = c->rules; r; r = r->next) {
         printf("  %s( ", r->head);
@@ -198,6 +222,15 @@ void closure_dump(const ClosureIR *c) {
         }
         printf("\n");
         
+        /* Dump comparisons (v0.8) */
+        if (r->comparisons) {
+            int total_cmps = 0;
+            for (int i = 0; i < r->body_count; i++) total_cmps += r->comparison_counts[i];
+            if (total_cmps > 0) {
+                printf("    Filters: %d comparisons\n", total_cmps);
+            }
+        }
+        
         if (r->arg_binding_count > 0) {
             printf("    Bindings:\n");
             for (int i = 0; i < r->arg_binding_count; i++) {
@@ -205,8 +238,8 @@ void closure_dump(const ClosureIR *c) {
                 printf("      %s: ", b->var_name);
                 for (int j = 0; j < b->location_count; j++) {
                     if (j > 0) printf(", ");
-                    printf("atom[%d].arg[%d]", 
-                           b->locations[j].atom_index, 
+                    printf("atom[%d].arg[%d]",
+                           b->locations[j].atom_index,
                            b->locations[j].arg_index);
                 }
                 if (b->is_head) {
@@ -229,22 +262,16 @@ ClosureIR *synthesize(const Graph *g) {
     for (Node *n = g->nodes; n; n = n->next) {
         if (n->type != NODE_DERIVED) continue;
         
-        /* ============================================================ */
-        /* CASE 1: Node has BASE edges (observe/derive -> impl)         */
-        /* Create SEPARATE rule for each BASE edge                      */
-        /* ============================================================ */
+        /* CASE 1: Node has BASE edges */
         int base_edge_count = 0;
         for (Edge *e = n->outgoing; e; e = e->next) {
             if (e->type == EDGE_DEFINED_BY_BASE) {
                 base_edge_count++;
             }
         }
-        
         if (base_edge_count > 0) {
-            /* Create one rule per BASE edge */
             for (Edge *e = n->outgoing; e; e = e->next) {
                 if (e->type != EDGE_DEFINED_BY_BASE) continue;
-                
                 Rule *r = calloc(1, sizeof(Rule));
                 r->head = strdup(n->name);
                 r->head_arity = n->arity;
@@ -256,25 +283,21 @@ ClosureIR *synthesize(const Graph *g) {
                 r->aggregate_fields = NULL;
                 r->arith_exprs = NULL;
                 r->arith_result_vars = NULL;
+                r->comparisons = calloc(1, sizeof(Comparison*));
+                r->comparison_counts = calloc(1, sizeof(int));
                 r->arg_bindings = NULL;
                 r->arg_binding_count = 0;
-                
                 r->body_preds[0] = strdup(e->target->name);
                 r->body_arities[0] = e->target->arity;
                 r->body_negative[0] = 0;
                 r->is_recursive = 0;
-                
-                /* Build ArgBindings for this single BASE edge */
                 build_bindings_for_edge(r, e, n);
-                
                 add_rule_to_closure(closure, r);
             }
-            continue; /* Skip further processing for this node */
+            continue;
         }
         
-        /* ============================================================ */
-        /* CASE 2: Aggregate rule                                       */
-        /* ============================================================ */
+        /* CASE 2: Aggregate rule */
         Edge *agg_edge = NULL;
         for (Edge *e = n->outgoing; e; e = e->next) {
             if (e->type == EDGE_DEFINED_BY_AGGREGATE) {
@@ -282,7 +305,6 @@ ClosureIR *synthesize(const Graph *g) {
                 break;
             }
         }
-        
         if (agg_edge) {
             Rule *r = calloc(1, sizeof(Rule));
             r->head = strdup(n->name);
@@ -295,23 +317,21 @@ ClosureIR *synthesize(const Graph *g) {
             r->aggregate_fields = malloc(sizeof(int));
             r->arith_exprs = NULL;
             r->arith_result_vars = NULL;
+            r->comparisons = calloc(1, sizeof(Comparison*));
+            r->comparison_counts = calloc(1, sizeof(int));
             r->arg_bindings = NULL;
             r->arg_binding_count = 0;
-            
             r->body_preds[0] = strdup(agg_edge->target->name);
             r->body_arities[0] = agg_edge->target->arity;
             r->body_negative[0] = 0;
             r->aggregate_funcs[0] = strdup(agg_edge->aggregate_func);
             r->aggregate_fields[0] = agg_edge->aggregate_field;
             r->is_recursive = 0;
-            
             add_rule_to_closure(closure, r);
             continue;
         }
         
-        /* ============================================================ */
-        /* CASE 3: Arithmetic rule                                      */
-        /* ============================================================ */
+        /* CASE 3: Arithmetic rule */
         Edge *arith_edge = NULL;
         for (Edge *e = n->outgoing; e; e = e->next) {
             if (e->type == EDGE_DEFINED_BY_ARITHMETIC) {
@@ -319,15 +339,14 @@ ClosureIR *synthesize(const Graph *g) {
                 break;
             }
         }
-        
         if (arith_edge) {
             int regular_count = 0;
             for (Edge *e = n->outgoing; e; e = e->next) {
-                if (e->type != EDGE_DEFINED_BY_ARITHMETIC) {
+                if (e->type != EDGE_DEFINED_BY_ARITHMETIC &&
+                    e->type != EDGE_DEFINED_BY_FILTER) {
                     regular_count++;
                 }
             }
-            
             int total_count = regular_count + 1;
             Rule *r = calloc(1, sizeof(Rule));
             r->head = strdup(n->name);
@@ -340,34 +359,47 @@ ClosureIR *synthesize(const Graph *g) {
             r->aggregate_fields = NULL;
             r->arith_exprs = calloc(total_count, sizeof(Expr*));
             r->arith_result_vars = calloc(total_count, sizeof(char*));
+            r->comparisons = calloc(total_count, sizeof(Comparison*));
+            r->comparison_counts = calloc(total_count, sizeof(int));
             r->arg_bindings = NULL;
             r->arg_binding_count = 0;
             r->is_recursive = 0;
             
+            Edge *filter_edge = NULL;
+            for (Edge *e = n->outgoing; e; e = e->next) {
+                if (e->type == EDGE_DEFINED_BY_FILTER) {
+                    filter_edge = e;
+                    break;
+                }
+            }
+            
             int idx = 0;
             for (Edge *e = n->outgoing; e; e = e->next) {
                 if (e->type == EDGE_DEFINED_BY_ARITHMETIC) continue;
-                
+                if (e->type == EDGE_DEFINED_BY_FILTER) continue;
                 r->body_preds[idx] = strdup(e->target->name);
                 r->body_arities[idx] = e->target->arity;
                 r->body_negative[idx] = (e->type == EDGE_DEFINED_BY_NEGATION);
                 idx++;
             }
-            
             r->body_preds[idx] = strdup("__arith__");
             r->body_arities[idx] = 0;
             r->body_negative[idx] = 0;
             r->arith_exprs[idx] = copy_expr(arith_edge->arith_expr);
             r->arith_result_vars[idx] = strdup(arith_edge->arith_result_var);
             
-            /* Build ArgBindings from regular edges */
+            if (filter_edge) {
+                r->comparisons[idx] = copy_comparisons(
+                    filter_edge->comparisons, filter_edge->comparison_count,
+                    &r->comparison_counts[idx]);
+            }
+            
             BindingTable bt;
             binding_table_init(&bt);
-            
             int edge_idx = 0;
             for (Edge *e = n->outgoing; e; e = e->next) {
                 if (e->type == EDGE_DEFINED_BY_ARITHMETIC) continue;
-                
+                if (e->type == EDGE_DEFINED_BY_FILTER) continue;
                 for (int j = 0; j < e->var_binding_count; j++) {
                     const char *var = e->var_bindings[j].var_name;
                     int bidx = binding_table_find_or_create(&bt, var);
@@ -375,40 +407,33 @@ ClosureIR *synthesize(const Graph *g) {
                 }
                 edge_idx++;
             }
-            
-            /* Add arithmetic result variable as HEAD binding at last position */
             if (arith_edge->arith_result_var) {
                 int bidx = binding_table_find_or_create(&bt, arith_edge->arith_result_var);
                 bt.bindings[bidx].is_head = 1;
                 bt.bindings[bidx].head_arg_index = n->arity - 1;
             }
-            
-            /* Mark other head params */
             if (n->head_params && n->head_param_count > 0) {
                 binding_table_mark_head(&bt, n->head_params, n->head_param_count);
             }
-            
             r->arg_bindings = bt.bindings;
             r->arg_binding_count = bt.count;
-            
             add_rule_to_closure(closure, r);
             continue;
         }
         
-        /* ============================================================ */
-        /* CASE 4: General rule (composition, negation, recursion)      */
-        /* Build single rule with all non-special edges                 */
-        /* ============================================================ */
+        /* CASE 4: General rule */
         int body_count = 0;
+        Edge *filter_edge = NULL;
         for (Edge *e = n->outgoing; e; e = e->next) {
             if (e->type == EDGE_DEFINED_BY_COMPOSITION ||
                 e->type == EDGE_DEFINED_BY_NEGATION ||
                 e->type == EDGE_DEFINED_BY_RECURSIVE ||
                 e->type == EDGE_DEFINED_BY_BASE) {
                 body_count++;
+            } else if (e->type == EDGE_DEFINED_BY_FILTER) {
+                filter_edge = e;
             }
         }
-        
         if (body_count == 0) continue;
         
         Rule *r = calloc(1, sizeof(Rule));
@@ -422,6 +447,8 @@ ClosureIR *synthesize(const Graph *g) {
         r->aggregate_fields = NULL;
         r->arith_exprs = NULL;
         r->arith_result_vars = NULL;
+        r->comparisons = calloc(body_count, sizeof(Comparison*));
+        r->comparison_counts = calloc(body_count, sizeof(int));
         
         int i = 0;
         for (Edge *e = n->outgoing; e; e = e->next) {
@@ -436,7 +463,6 @@ ClosureIR *synthesize(const Graph *g) {
             }
         }
         
-        /* Detect recursion */
         r->is_recursive = 0;
         for (int k = 0; k < r->body_count; k++) {
             if (strcmp(r->body_preds[k], r->head) == 0) {
@@ -445,10 +471,18 @@ ClosureIR *synthesize(const Graph *g) {
             }
         }
         
-        /* Build ArgBindings from all body edges */
+        if (filter_edge) {
+            for (int k = 0; k < body_count; k++) {
+                r->comparisons[k] = NULL;
+                r->comparison_counts[k] = 0;
+            }
+            r->comparisons[0] = copy_comparisons(
+                filter_edge->comparisons, filter_edge->comparison_count,
+                &r->comparison_counts[0]);
+        }
+        
         BindingTable bt;
         binding_table_init(&bt);
-        
         int edge_idx = 0;
         for (Edge *e = n->outgoing; e; e = e->next) {
             if (e->type == EDGE_DEFINED_BY_COMPOSITION ||
@@ -463,16 +497,12 @@ ClosureIR *synthesize(const Graph *g) {
                 edge_idx++;
             }
         }
-        
         if (n->head_params && n->head_param_count > 0) {
             binding_table_mark_head(&bt, n->head_params, n->head_param_count);
         }
-        
         r->arg_bindings = bt.bindings;
         r->arg_binding_count = bt.count;
-        
         add_rule_to_closure(closure, r);
     }
-    
     return closure;
 }

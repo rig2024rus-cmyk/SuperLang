@@ -13,10 +13,6 @@ Program *program_new(void) {
     return p;
 }
 
-/* ====================================================================== */
-/* Expression constructors                                                */
-/* ====================================================================== */
-
 Expr *expr_new_number(double n, SourceLocation loc) {
     Expr *e = calloc(1, sizeof(Expr));
     e->type = EXPR_NUMBER;
@@ -54,11 +50,8 @@ Expr *expr_new_unary_minus(Expr *operand, SourceLocation loc) {
 void expr_free(Expr *e) {
     if (!e) return;
     switch (e->type) {
-        case EXPR_NUMBER:
-            break;
-        case EXPR_VARIABLE:
-            free(e->var_name);
-            break;
+        case EXPR_NUMBER: break;
+        case EXPR_VARIABLE: free(e->var_name); break;
         case EXPR_BINARY:
             expr_free(e->binary.left);
             expr_free(e->binary.right);
@@ -70,16 +63,20 @@ void expr_free(Expr *e) {
     free(e);
 }
 
+void comparison_free(Comparison *c) {
+    if (!c) return;
+    if (c->left) expr_free(c->left);
+    if (c->right) expr_free(c->right);
+}
+
 void expr_dump(const Expr *e, int indent) {
     if (!e) return;
     for (int i = 0; i < indent; i++) printf("  ");
     switch (e->type) {
         case EXPR_NUMBER:
-            printf("NUM %g\n", e->number);
-            break;
+            printf("NUM %g\n", e->number); break;
         case EXPR_VARIABLE:
-            printf("VAR %s\n", e->var_name);
-            break;
+            printf("VAR %s\n", e->var_name); break;
         case EXPR_BINARY:
             printf("BIN '%c'\n", e->binary.op);
             expr_dump(e->binary.left, indent + 1);
@@ -91,10 +88,6 @@ void expr_dump(const Expr *e, int indent) {
             break;
     }
 }
-
-/* ====================================================================== */
-/* Other AST constructors                                                 */
-/* ====================================================================== */
 
 void atom_init(Atom *a, const char *predicate, int negated, SourceLocation loc) {
     a->predicate = strdup(predicate);
@@ -117,6 +110,8 @@ void condition_init(Condition *c, SourceLocation loc) {
     c->atom_count = 0;
     c->arith_assigns = NULL;
     c->arith_count = 0;
+    c->comparisons = NULL;
+    c->comparison_count = 0;
     c->loc = loc;
 }
 
@@ -132,9 +127,11 @@ void condition_add_arith(Condition *c, const ArithAssignment *a) {
     c->arith_assigns[c->arith_count - 1] = *a;
 }
 
-/* ====================================================================== */
-/* Destructors                                                            */
-/* ====================================================================== */
+void condition_add_comparison(Condition *c, const Comparison *cmp) {
+    c->comparison_count++;
+    c->comparisons = realloc(c->comparisons, sizeof(Comparison) * c->comparison_count);
+    c->comparisons[c->comparison_count - 1] = *cmp;
+}
 
 void atom_free(Atom *a) {
     if (!a) return;
@@ -152,14 +149,12 @@ void arith_assignment_free(ArithAssignment *a) {
 
 void condition_free(Condition *c) {
     if (!c) return;
-    for (int i = 0; i < c->atom_count; i++) {
-        atom_free(&c->atoms[i]);
-    }
+    for (int i = 0; i < c->atom_count; i++) atom_free(&c->atoms[i]);
     free(c->atoms);
-    for (int i = 0; i < c->arith_count; i++) {
-        arith_assignment_free(&c->arith_assigns[i]);
-    }
+    for (int i = 0; i < c->arith_count; i++) arith_assignment_free(&c->arith_assigns[i]);
     free(c->arith_assigns);
+    for (int i = 0; i < c->comparison_count; i++) comparison_free(&c->comparisons[i]);
+    free(c->comparisons);
 }
 
 void input_fact_free(InputFact *f) {
@@ -176,18 +171,13 @@ void query_free(Query *q) {
     free(q->args);
 }
 
-static void entity_decl_free(EntityDecl *e) {
-    if (!e) return;
-    free(e->name);
-}
-
+static void entity_decl_free(EntityDecl *e) { if (!e) return; free(e->name); }
 static void relation_decl_free(RelationDecl *r) {
     if (!r) return;
     free(r->name);
     for (int i = 0; i < r->param_count; i++) free(r->params[i]);
     free(r->params);
 }
-
 static void observe_decl_free(ObserveDecl *o) {
     if (!o) return;
     free(o->name);
@@ -195,7 +185,6 @@ static void observe_decl_free(ObserveDecl *o) {
     free(o->params);
     condition_free(&o->condition);
 }
-
 static void derive_decl_free(DeriveDecl *d) {
     if (!d) return;
     free(d->name);
@@ -263,6 +252,20 @@ void program_dump(const Program *p) {
                 printf(", %s = <expr>", d->condition.arith_assigns[j].result_var);
             }
         }
+        if (d->condition.comparison_count > 0) {
+            for (int j = 0; j < d->condition.comparison_count; j++) {
+                const char *op_str = "?";
+                switch (d->condition.comparisons[j].op) {
+                    case CMP_EQ: op_str = "=="; break;
+                    case CMP_NE: op_str = "!="; break;
+                    case CMP_LT: op_str = "<"; break;
+                    case CMP_LE: op_str = "<="; break;
+                    case CMP_GT: op_str = ">"; break;
+                    case CMP_GE: op_str = ">="; break;
+                }
+                printf(", <expr> %s <expr>", op_str);
+            }
+        }
         printf("\n");
     }
     if (p->input_count > 0) {
@@ -277,10 +280,6 @@ void program_dump(const Program *p) {
         printf(")  @%d:%d\n", p->queries[i].loc.line, p->queries[i].loc.column);
     }
 }
-
-/* ====================================================================== */
-/* Parser helpers                                                         */
-/* ====================================================================== */
 
 static Token *parser_current(Parser *p) {
     if (p->pos < p->tokens->count) {
@@ -322,13 +321,11 @@ static SourceLocation parser_loc(Parser *p) {
 static void parser_parse_ident_list(Parser *p, char ***out_params, int *out_count, ParseResult *result) {
     *out_params = NULL;
     *out_count = 0;
-    
     if (parser_current(p)->type == TOK_IDENT) {
         (*out_count)++;
         *out_params = realloc(*out_params, sizeof(char*) * (*out_count));
         (*out_params)[*out_count - 1] = strdup(parser_current(p)->value);
         p->pos++;
-        
         while (parser_match(p, TOK_COMMA)) {
             if (parser_current(p)->type != TOK_IDENT) {
                 result->error_message = strdup("Expected identifier after comma");
@@ -348,14 +345,12 @@ static void parser_parse_ident_list(Parser *p, char ***out_params, int *out_coun
 static void parser_parse_arg_list(Parser *p, char ***out_args, int *out_count, ParseResult *result) {
     *out_args = NULL;
     *out_count = 0;
-    
     TokenType t = parser_current(p)->type;
     if (t == TOK_IDENT || t == TOK_STRING || t == TOK_NUMBER) {
         (*out_count)++;
         *out_args = realloc(*out_args, sizeof(char*) * (*out_count));
         (*out_args)[*out_count - 1] = strdup(parser_current(p)->value);
         p->pos++;
-        
         while (parser_match(p, TOK_COMMA)) {
             t = parser_current(p)->type;
             if (t != TOK_IDENT && t != TOK_STRING && t != TOK_NUMBER) {
@@ -373,32 +368,25 @@ static void parser_parse_arg_list(Parser *p, char ***out_args, int *out_count, P
     }
 }
 
-/* ====================================================================== */
-/* Expression parser (recursive descent with precedence)                 */
-/* ====================================================================== */
-
 static Expr *parse_expr(Parser *p, ParseResult *result);
 
 static Expr *parse_factor(Parser *p, ParseResult *result) {
     SourceLocation loc = parser_loc(p);
     Token *tok = parser_current(p);
-    
-    /* Number */
+
     if (tok->type == TOK_NUMBER) {
         double n = strtod(tok->value, NULL);
         p->pos++;
         return expr_new_number(n, loc);
     }
-    
-    /* Unary minus */
+
     if (tok->type == TOK_MINUS) {
         p->pos++;
         Expr *operand = parse_factor(p, result);
         if (!result->is_valid) return NULL;
         return expr_new_unary_minus(operand, loc);
     }
-    
-    /* Parenthesized expression */
+
     if (tok->type == TOK_LPAREN) {
         p->pos++;
         Expr *inner = parse_expr(p, result);
@@ -409,15 +397,13 @@ static Expr *parse_factor(Parser *p, ParseResult *result) {
         }
         return inner;
     }
-    
-    /* Variable */
+
     if (tok->type == TOK_IDENT) {
         Expr *e = expr_new_variable(tok->value, loc);
         p->pos++;
         return e;
     }
-    
-    /* Error */
+
     char msg[256];
     snprintf(msg, sizeof(msg), "Unexpected token in expression: %s '%s'",
              token_type_str(tok->type), tok->value);
@@ -431,63 +417,55 @@ static Expr *parse_factor(Parser *p, ParseResult *result) {
 static Expr *parse_term(Parser *p, ParseResult *result) {
     Expr *left = parse_factor(p, result);
     if (!result->is_valid) return NULL;
-    
+
     while (parser_current(p)->type == TOK_STAR ||
-           parser_current(p)->type == TOK_SLASH) {
+           parser_current(p)->type == TOK_SLASH ||
+           parser_current(p)->type == TOK_MODULO) {
         SourceLocation loc = parser_loc(p);
-        char op = (parser_current(p)->type == TOK_STAR) ? '*' : '/';
+        char op;
+        if (parser_current(p)->type == TOK_STAR) op = '*';
+        else if (parser_current(p)->type == TOK_SLASH) op = '/';
+        else op = '%';
         p->pos++;
-        
         Expr *right = parse_factor(p, result);
         if (!result->is_valid) {
             expr_free(left);
             return NULL;
         }
-        
         left = expr_new_binary(op, left, right, loc);
     }
-    
     return left;
 }
 
 static Expr *parse_expr(Parser *p, ParseResult *result) {
     Expr *left = parse_term(p, result);
     if (!result->is_valid) return NULL;
-    
+
     while (parser_current(p)->type == TOK_PLUS ||
            parser_current(p)->type == TOK_MINUS) {
         SourceLocation loc = parser_loc(p);
         char op = (parser_current(p)->type == TOK_PLUS) ? '+' : '-';
         p->pos++;
-        
         Expr *right = parse_term(p, result);
         if (!result->is_valid) {
             expr_free(left);
             return NULL;
         }
-        
         left = expr_new_binary(op, left, right, loc);
     }
-    
     return left;
 }
-
-/* ====================================================================== */
-/* Atom parser                                                            */
-/* ====================================================================== */
 
 static void parser_parse_atom(Parser *p, Atom *out, ParseResult *result) {
     SourceLocation loc = parser_loc(p);
     int negated = parser_match(p, TOK_NOT);
-    
     char *result_var = NULL;
     int is_aggregate = 0;
-    
+
     if (parser_current(p)->type == TOK_IDENT) {
         size_t saved_pos = p->pos;
         char *possible_var = parser_current(p)->value;
         p->pos++;
-        
         if (parser_current(p)->type == TOK_ASSIGN) {
             p->pos++;
             TokenType next = parser_current(p)->type;
@@ -501,11 +479,10 @@ static void parser_parse_atom(Parser *p, Atom *out, ParseResult *result) {
             p->pos = saved_pos;
         }
     }
-    
+
     if (is_aggregate) {
         Token *agg_tok = parser_current(p);
         p->pos++;
-        
         char *agg_func = NULL;
         switch (agg_tok->type) {
             case TOK_SUM: agg_func = "sum"; break;
@@ -514,63 +491,34 @@ static void parser_parse_atom(Parser *p, Atom *out, ParseResult *result) {
             case TOK_MAX: agg_func = "max"; break;
             default: break;
         }
-        
-        if (!parser_consume(p, TOK_LPAREN, result)) {
-            free(result_var);
-            return;
-        }
-        
+        if (!parser_consume(p, TOK_LPAREN, result)) { free(result_var); return; }
         Token *pred = parser_consume(p, TOK_IDENT, result);
-        if (!pred) {
-            free(result_var);
-            return;
-        }
-        
-        if (!parser_consume(p, TOK_LPAREN, result)) {
-            free(result_var);
-            return;
-        }
-        
+        if (!pred) { free(result_var); return; }
+        if (!parser_consume(p, TOK_LPAREN, result)) { free(result_var); return; }
         char **args = NULL;
         int arg_count = 0;
         parser_parse_arg_list(p, &args, &arg_count, result);
         if (!result->is_valid) {
             for (int i = 0; i < arg_count; i++) free(args[i]);
-            free(args);
-            free(result_var);
-            return;
+            free(args); free(result_var); return;
         }
-        
         if (!parser_consume(p, TOK_RPAREN, result)) {
             for (int i = 0; i < arg_count; i++) free(args[i]);
-            free(args);
-            free(result_var);
-            return;
+            free(args); free(result_var); return;
         }
-        
         if (!parser_consume(p, TOK_COMMA, result)) {
             for (int i = 0; i < arg_count; i++) free(args[i]);
-            free(args);
-            free(result_var);
-            return;
+            free(args); free(result_var); return;
         }
-        
         Token *agg_arg = parser_consume(p, TOK_IDENT, result);
         if (!agg_arg) {
             for (int i = 0; i < arg_count; i++) free(args[i]);
-            free(args);
-            free(result_var);
-            return;
+            free(args); free(result_var); return;
         }
-        
         int agg_field = -1;
         for (int i = 0; i < arg_count; i++) {
-            if (strcmp(args[i], agg_arg->value) == 0) {
-                agg_field = i;
-                break;
-            }
+            if (strcmp(args[i], agg_arg->value) == 0) { agg_field = i; break; }
         }
-        
         if (agg_field == -1) {
             char msg[256];
             snprintf(msg, sizeof(msg),
@@ -581,60 +529,41 @@ static void parser_parse_atom(Parser *p, Atom *out, ParseResult *result) {
             result->error_column = agg_arg->column;
             result->is_valid = 0;
             for (int i = 0; i < arg_count; i++) free(args[i]);
-            free(args);
-            free(result_var);
-            return;
+            free(args); free(result_var); return;
         }
-        
         if (!parser_consume(p, TOK_RPAREN, result)) {
             for (int i = 0; i < arg_count; i++) free(args[i]);
-            free(args);
-            free(result_var);
-            return;
+            free(args); free(result_var); return;
         }
-        
         atom_init(out, pred->value, negated, loc);
         out->aggregate_func = strdup(agg_func);
         out->aggregate_field = agg_field;
-        for (int i = 0; i < arg_count; i++) {
-            atom_add_arg(out, args[i]);
-        }
+        for (int i = 0; i < arg_count; i++) atom_add_arg(out, args[i]);
         for (int i = 0; i < arg_count; i++) free(args[i]);
         free(args);
-        
         char **new_args = malloc(sizeof(char*) * (out->arg_count + 1));
         new_args[0] = result_var;
-        for (int i = 0; i < out->arg_count; i++) {
-            new_args[i + 1] = out->args[i];
-        }
+        for (int i = 0; i < out->arg_count; i++) new_args[i + 1] = out->args[i];
         free(out->args);
         out->args = new_args;
         out->arg_count++;
     } else {
         Token *pred = parser_consume(p, TOK_IDENT, result);
         if (!pred) return;
-        
         if (!parser_consume(p, TOK_LPAREN, result)) return;
-        
         char **args = NULL;
         int arg_count = 0;
         parser_parse_arg_list(p, &args, &arg_count, result);
         if (!result->is_valid) {
             for (int i = 0; i < arg_count; i++) free(args[i]);
-            free(args);
-            return;
+            free(args); return;
         }
-        
         if (!parser_consume(p, TOK_RPAREN, result)) {
             for (int i = 0; i < arg_count; i++) free(args[i]);
-            free(args);
-            return;
+            free(args); return;
         }
-        
         atom_init(out, pred->value, negated, loc);
-        for (int i = 0; i < arg_count; i++) {
-            atom_add_arg(out, args[i]);
-        }
+        for (int i = 0; i < arg_count; i++) atom_add_arg(out, args[i]);
         for (int i = 0; i < arg_count; i++) free(args[i]);
         free(args);
     }
@@ -643,58 +572,104 @@ static void parser_parse_atom(Parser *p, Atom *out, ParseResult *result) {
 static void parser_parse_condition(Parser *p, Condition *out, ParseResult *result) {
     SourceLocation loc = parser_loc(p);
     condition_init(out, loc);
-    
+
     while (1) {
-        /* Check if this is an arithmetic assignment: IDENT '=' expr */
+        if (parser_current(p)->type == TOK_NOT) {
+            Atom atom;
+            parser_parse_atom(p, &atom, result);
+            if (!result->is_valid) return;
+            condition_add_atom(out, &atom);
+            if (!parser_match(p, TOK_COMMA)) break;
+            continue;
+        }
+
         int is_arith = 0;
         if (parser_current(p)->type == TOK_IDENT) {
             size_t saved_pos = p->pos;
             const char *var_name = parser_current(p)->value;
             p->pos++;
-            
             if (parser_current(p)->type == TOK_ASSIGN) {
                 p->pos++;
                 TokenType next = parser_current(p)->type;
-                
-                /* It's an aggregate if next is sum/count/min/max followed by '(' */
                 if ((next == TOK_SUM || next == TOK_COUNT || next == TOK_MIN || next == TOK_MAX) &&
                     p->pos + 1 < p->tokens->count &&
                     p->tokens->tokens[p->pos + 1].type == TOK_LPAREN) {
-                    /* Aggregate — rollback and parse as atom */
                     p->pos = saved_pos;
                     is_arith = 0;
                 } else {
-                    /* Arithmetic assignment */
                     is_arith = 1;
-                    
                     SourceLocation arith_loc = parser_loc(p);
                     Expr *expr = parse_expr(p, result);
                     if (!result->is_valid) {
-                        /* FIXED: Don't free var_name — it belongs to the token */
                         if (expr) expr_free(expr);
                         return;
                     }
-                    
                     ArithAssignment a;
-                    a.result_var = strdup(var_name);  /* Make a copy */
+                    a.result_var = strdup(var_name);
                     a.expr = expr;
                     a.loc = arith_loc;
                     condition_add_arith(out, &a);
                 }
             } else {
-                /* Not an assignment, rollback */
                 p->pos = saved_pos;
             }
         }
-        
+
         if (!is_arith) {
-            /* Regular atom */
-            Atom atom;
-            parser_parse_atom(p, &atom, result);
-            if (!result->is_valid) return;
-            condition_add_atom(out, &atom);
+            size_t saved_pos = p->pos;
+            Expr *left = parse_expr(p, result);
+
+            if (!result->is_valid) {
+                if (left) expr_free(left);
+                free(result->error_message);
+                result->error_message = NULL;
+                result->is_valid = 1;
+                p->pos = saved_pos;
+                Atom atom;
+                parser_parse_atom(p, &atom, result);
+                if (!result->is_valid) return;
+                condition_add_atom(out, &atom);
+            } else {
+                TokenType op_tok = parser_current(p)->type;
+                CmpOp cmp_op;
+                int is_comparison = 1;
+
+                switch (op_tok) {
+                    case TOK_EQUALS:     cmp_op = CMP_EQ; break;
+                    case TOK_NOT_EQUALS: cmp_op = CMP_NE; break;
+                    case TOK_LESS:       cmp_op = CMP_LT; break;
+                    case TOK_LESS_EQ:    cmp_op = CMP_LE; break;
+                    case TOK_GREATER:    cmp_op = CMP_GT; break;
+                    case TOK_GREATER_EQ: cmp_op = CMP_GE; break;
+                    default: is_comparison = 0; break;
+                }
+
+                if (is_comparison) {
+                    p->pos++;
+                    SourceLocation cmp_loc = parser_loc(p);
+                    Expr *right = parse_expr(p, result);
+                    if (!result->is_valid) {
+                        expr_free(left);
+                        if (right) expr_free(right);
+                        return;
+                    }
+                    Comparison cmp;
+                    cmp.left = left;
+                    cmp.op = cmp_op;
+                    cmp.right = right;
+                    cmp.loc = cmp_loc;
+                    condition_add_comparison(out, &cmp);
+                } else {
+                    expr_free(left);
+                    p->pos = saved_pos;
+                    Atom atom;
+                    parser_parse_atom(p, &atom, result);
+                    if (!result->is_valid) return;
+                    condition_add_atom(out, &atom);
+                }
+            }
         }
-        
+
         if (!parser_match(p, TOK_COMMA)) break;
     }
 }
@@ -703,15 +678,12 @@ static void parser_parse_entity(Parser *p, Program *prog, ParseResult *result) {
     SourceLocation loc = parser_loc(p);
     parser_consume(p, TOK_ENTITY, result);
     if (!result->is_valid) return;
-    
     Token *name = parser_consume(p, TOK_IDENT, result);
     if (!name) return;
-    
     if (prog->entity_count >= prog->entity_capacity) {
         prog->entity_capacity = prog->entity_capacity == 0 ? 4 : prog->entity_capacity * 2;
         prog->entities = realloc(prog->entities, sizeof(EntityDecl) * prog->entity_capacity);
     }
-    
     EntityDecl *e = &prog->entities[prog->entity_count++];
     e->name = strdup(name->value);
     e->loc = loc;
@@ -721,32 +693,24 @@ static void parser_parse_relation(Parser *p, Program *prog, ParseResult *result)
     SourceLocation loc = parser_loc(p);
     parser_consume(p, TOK_RELATION, result);
     if (!result->is_valid) return;
-    
     Token *name = parser_consume(p, TOK_IDENT, result);
     if (!name) return;
-    
     if (!parser_consume(p, TOK_LPAREN, result)) return;
-    
     char **params = NULL;
     int param_count = 0;
     parser_parse_ident_list(p, &params, &param_count, result);
     if (!result->is_valid) {
         for (int i = 0; i < param_count; i++) free(params[i]);
-        free(params);
-        return;
+        free(params); return;
     }
-    
     if (!parser_consume(p, TOK_RPAREN, result)) {
         for (int i = 0; i < param_count; i++) free(params[i]);
-        free(params);
-        return;
+        free(params); return;
     }
-    
     if (prog->relation_count >= prog->relation_capacity) {
         prog->relation_capacity = prog->relation_capacity == 0 ? 4 : prog->relation_capacity * 2;
         prog->relations = realloc(prog->relations, sizeof(RelationDecl) * prog->relation_capacity);
     }
-    
     RelationDecl *r = &prog->relations[prog->relation_count++];
     r->name = strdup(name->value);
     r->params = params;
@@ -758,46 +722,34 @@ static void parser_parse_observe(Parser *p, Program *prog, ParseResult *result) 
     SourceLocation loc = parser_loc(p);
     parser_consume(p, TOK_OBSERVE, result);
     if (!result->is_valid) return;
-    
     Token *name = parser_consume(p, TOK_IDENT, result);
     if (!name) return;
-    
     if (!parser_consume(p, TOK_LPAREN, result)) return;
-    
     char **params = NULL;
     int param_count = 0;
     parser_parse_ident_list(p, &params, &param_count, result);
     if (!result->is_valid) {
         for (int i = 0; i < param_count; i++) free(params[i]);
-        free(params);
-        return;
+        free(params); return;
     }
-    
     if (!parser_consume(p, TOK_RPAREN, result)) {
         for (int i = 0; i < param_count; i++) free(params[i]);
-        free(params);
-        return;
+        free(params); return;
     }
-    
     if (!parser_consume(p, TOK_WHERE, result)) {
         for (int i = 0; i < param_count; i++) free(params[i]);
-        free(params);
-        return;
+        free(params); return;
     }
-    
     Condition cond;
     parser_parse_condition(p, &cond, result);
     if (!result->is_valid) {
         for (int i = 0; i < param_count; i++) free(params[i]);
-        free(params);
-        return;
+        free(params); return;
     }
-    
     if (prog->observe_count >= prog->observe_capacity) {
         prog->observe_capacity = prog->observe_capacity == 0 ? 4 : prog->observe_capacity * 2;
         prog->observes = realloc(prog->observes, sizeof(ObserveDecl) * prog->observe_capacity);
     }
-    
     ObserveDecl *o = &prog->observes[prog->observe_count++];
     o->name = strdup(name->value);
     o->params = params;
@@ -810,46 +762,34 @@ static void parser_parse_derive(Parser *p, Program *prog, ParseResult *result) {
     SourceLocation loc = parser_loc(p);
     parser_consume(p, TOK_DERIVE, result);
     if (!result->is_valid) return;
-    
     Token *name = parser_consume(p, TOK_IDENT, result);
     if (!name) return;
-    
     if (!parser_consume(p, TOK_LPAREN, result)) return;
-    
     char **params = NULL;
     int param_count = 0;
     parser_parse_ident_list(p, &params, &param_count, result);
     if (!result->is_valid) {
         for (int i = 0; i < param_count; i++) free(params[i]);
-        free(params);
-        return;
+        free(params); return;
     }
-    
     if (!parser_consume(p, TOK_RPAREN, result)) {
         for (int i = 0; i < param_count; i++) free(params[i]);
-        free(params);
-        return;
+        free(params); return;
     }
-    
     if (!parser_consume(p, TOK_FROM, result)) {
         for (int i = 0; i < param_count; i++) free(params[i]);
-        free(params);
-        return;
+        free(params); return;
     }
-    
     Condition cond;
     parser_parse_condition(p, &cond, result);
     if (!result->is_valid) {
         for (int i = 0; i < param_count; i++) free(params[i]);
-        free(params);
-        return;
+        free(params); return;
     }
-    
     if (prog->derive_count >= prog->derive_capacity) {
         prog->derive_capacity = prog->derive_capacity == 0 ? 4 : prog->derive_capacity * 2;
         prog->derives = realloc(prog->derives, sizeof(DeriveDecl) * prog->derive_capacity);
     }
-    
     DeriveDecl *d = &prog->derives[prog->derive_count++];
     d->name = strdup(name->value);
     d->params = params;
@@ -861,44 +801,33 @@ static void parser_parse_derive(Parser *p, Program *prog, ParseResult *result) {
 static void parser_parse_input_block(Parser *p, Program *prog, ParseResult *result) {
     parser_consume(p, TOK_INPUT, result);
     if (!result->is_valid) return;
-    
     if (!parser_consume(p, TOK_LBRACE, result)) return;
-    
     while (parser_current(p)->type != TOK_RBRACE && parser_current(p)->type != TOK_EOF) {
         SourceLocation loc = parser_loc(p);
-        
         Token *pred = parser_consume(p, TOK_IDENT, result);
         if (!pred) return;
-        
         if (!parser_consume(p, TOK_LPAREN, result)) return;
-        
         char **args = NULL;
         int arg_count = 0;
         parser_parse_arg_list(p, &args, &arg_count, result);
         if (!result->is_valid) {
             for (int i = 0; i < arg_count; i++) free(args[i]);
-            free(args);
-            return;
+            free(args); return;
         }
-        
         if (!parser_consume(p, TOK_RPAREN, result)) {
             for (int i = 0; i < arg_count; i++) free(args[i]);
-            free(args);
-            return;
+            free(args); return;
         }
-        
         if (prog->input_count >= prog->input_capacity) {
             prog->input_capacity = prog->input_capacity == 0 ? 8 : prog->input_capacity * 2;
             prog->inputs = realloc(prog->inputs, sizeof(InputFact) * prog->input_capacity);
         }
-        
         InputFact *f = &prog->inputs[prog->input_count++];
         f->predicate = strdup(pred->value);
         f->args = args;
         f->arg_count = arg_count;
         f->loc = loc;
     }
-    
     parser_consume(p, TOK_RBRACE, result);
 }
 
@@ -906,32 +835,24 @@ static void parser_parse_query(Parser *p, Program *prog, ParseResult *result) {
     SourceLocation loc = parser_loc(p);
     parser_consume(p, TOK_QUERY, result);
     if (!result->is_valid) return;
-    
     Token *name = parser_consume(p, TOK_IDENT, result);
     if (!name) return;
-    
     if (!parser_consume(p, TOK_LPAREN, result)) return;
-    
     char **args = NULL;
     int arg_count = 0;
     parser_parse_arg_list(p, &args, &arg_count, result);
     if (!result->is_valid) {
         for (int i = 0; i < arg_count; i++) free(args[i]);
-        free(args);
-        return;
+        free(args); return;
     }
-    
     if (!parser_consume(p, TOK_RPAREN, result)) {
         for (int i = 0; i < arg_count; i++) free(args[i]);
-        free(args);
-        return;
+        free(args); return;
     }
-    
     if (prog->query_count >= prog->query_capacity) {
         prog->query_capacity = prog->query_capacity == 0 ? 4 : prog->query_capacity * 2;
         prog->queries = realloc(prog->queries, sizeof(Query) * prog->query_capacity);
     }
-    
     Query *q = &prog->queries[prog->query_count++];
     q->predicate = strdup(name->value);
     q->args = args;
@@ -946,7 +867,7 @@ ParseResult parser_parse(const TokenList *tokens) {
     result.error_message = NULL;
     result.error_line = 0;
     result.error_column = 0;
-    
+
     if (tokens->error_message) {
         result.is_valid = 0;
         result.error_message = strdup(tokens->error_message);
@@ -954,33 +875,20 @@ ParseResult parser_parse(const TokenList *tokens) {
         result.error_column = tokens->error_column;
         return result;
     }
-    
+
     Parser parser;
     parser.tokens = tokens;
     parser.pos = 0;
-    
+
     while (parser_current(&parser)->type != TOK_EOF) {
         Token *tok = parser_current(&parser);
-        
         switch (tok->type) {
-            case TOK_ENTITY:
-                parser_parse_entity(&parser, result.program, &result);
-                break;
-            case TOK_RELATION:
-                parser_parse_relation(&parser, result.program, &result);
-                break;
-            case TOK_OBSERVE:
-                parser_parse_observe(&parser, result.program, &result);
-                break;
-            case TOK_DERIVE:
-                parser_parse_derive(&parser, result.program, &result);
-                break;
-            case TOK_INPUT:
-                parser_parse_input_block(&parser, result.program, &result);
-                break;
-            case TOK_QUERY:
-                parser_parse_query(&parser, result.program, &result);
-                break;
+            case TOK_ENTITY:   parser_parse_entity(&parser, result.program, &result); break;
+            case TOK_RELATION: parser_parse_relation(&parser, result.program, &result); break;
+            case TOK_OBSERVE:  parser_parse_observe(&parser, result.program, &result); break;
+            case TOK_DERIVE:   parser_parse_derive(&parser, result.program, &result); break;
+            case TOK_INPUT:    parser_parse_input_block(&parser, result.program, &result); break;
+            case TOK_QUERY:    parser_parse_query(&parser, result.program, &result); break;
             default: {
                 char msg[128];
                 snprintf(msg, sizeof(msg), "Unexpected token '%s' at top level",
@@ -992,10 +900,9 @@ ParseResult parser_parse(const TokenList *tokens) {
                 break;
             }
         }
-        
         if (!result.is_valid) break;
     }
-    
+
     return result;
 }
 

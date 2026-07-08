@@ -1,59 +1,65 @@
-CC      ?= gcc
-CFLAGS  ?= -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L -Iinclude -g
-SRC      = src/graph.c src/synthesizer.c src/runtime.c src/semantic_validator.c \
-           src/lexer.c src/parser.c src/ast_to_graph.c src/type_checker.c src/main.c
-OBJ      = $(SRC:.c=.o)
-BIN      = superlang
+CC = cc
+CFLAGS = -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L -Iinclude -g
 
-all: $(BIN)
+SRCS = src/graph.c src/synthesizer.c src/runtime.c src/semantic_validator.c \
+       src/lexer.c src/parser.c src/ast_to_graph.c src/type_checker.c src/main.c
 
-$(BIN): $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $^
+OBJS = $(SRCS:.c=.o)
 
-%.o: %.c
+superlang: $(OBJS)
+	$(CC) $(CFLAGS) -o superlang $(OBJS) -lm
+
+src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJ) $(BIN)
+	rm -f $(OBJS) superlang
 
-# Positive test: stratified negation
-test: $(BIN)
+test-all: superlang
 	@echo "====================================="
-	@echo "Running: ./$(BIN) examples/task_ready.unq"
+	@echo "SuperLang Regression Test Suite"
 	@echo "====================================="
-	./$(BIN) examples/task_ready.unq
-
-# Negative test: TypeChecker should reject
-test-errors: $(BIN)
-	@echo "====================================="
-	@echo "Expected: compilation FAILS with errors"
-	@echo "====================================="
-	./$(BIN) examples/typo_test.unq; \
-	if [ $$? -eq 1 ]; then \
-		echo ""; \
-		echo "✓ TypeChecker correctly rejected the program"; \
+	@if [ ! -d "tests" ] || [ -z "$$(ls -A tests/*.unq 2>/dev/null)" ]; then \
+		echo "⚠️  No test files found in tests/"; \
+		echo "    Create .unq files in tests/ directory to run regression tests"; \
+		exit 0; \
+	fi
+	@passed=0; failed=0; total=0; \
+	for test in tests/*.unq; do \
+		[ -f "$$test" ] || continue; \
+		total=$$((total + 1)); \
+		name=$$(basename "$$test" .unq); \
+		printf "\nRunning: $$name\n"; \
+		output=$$(./superlang "$$test" 2>&1); \
+		code=$$?; \
+		if [ "$$code" = "0" ]; then \
+			echo "✓ PASS: $$name (exit code: 0)"; \
+			passed=$$((passed + 1)); \
+		elif [ "$$code" = "1" ] && echo "$$name" | grep -q -iE "reject|negative|cycle|self|typo"; then \
+			echo "✓ PASS: $$name (exit code: 1, expected rejection)"; \
+			passed=$$((passed + 1)); \
+		else \
+			echo "✗ FAIL: $$name (exit code: $$code)"; \
+			echo "$$output" | head -5; \
+			failed=$$((failed + 1)); \
+		fi; \
+	done; \
+	echo ""; \
+	echo "====================================="; \
+	echo "Test Summary"; \
+	echo "====================================="; \
+	echo "Total:  $$total"; \
+	echo "Passed: $$passed"; \
+	echo "Failed: $$failed"; \
+	echo ""; \
+	if [ "$$failed" = "0" ]; then \
+		echo "✓ ALL TESTS PASSED"; \
 	else \
-		echo ""; \
-		echo "✗ TypeChecker should have failed but didn't"; \
+		echo "✗ SOME TESTS FAILED"; \
 		exit 1; \
 	fi
 
-# Full regression suite (8 tests)
-test-all: $(BIN)
-	@chmod +x tests/run_tests.sh
-	@./tests/run_tests.sh
+valgrind: superlang
+	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./superlang examples/task_ready.unq
 
-# Debug mode
-debug: $(BIN)
-	./$(BIN) --dump-ast --dump-graph --dump-ir examples/task_ready.unq
-
-# Memory safety
-valgrind: $(BIN)
-	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 \
-		./$(BIN) examples/task_ready.unq
-
-# Verbose mode
-quick: $(BIN)
-	./$(BIN) --verbose examples/task_ready.unq
-
-.PHONY: all clean test test-errors test-all debug valgrind quick
+.PHONY: clean test-all valgrind

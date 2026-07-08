@@ -1,0 +1,13 @@
+relation parent(child, parent)
+
+input {
+    parent(Alice, Bob)
+    parent(Bob, Charlie)
+    parent(Alice, David)
+}
+
+derive ancestor(x, y) from parent(x, y)
+derive ancestor(x, y) from parent(x, z), ancestor(z, y)
+
+# Query derived predicate with variable
+query ancestor(Alice, X)       # → [Bob, Charlie, David]

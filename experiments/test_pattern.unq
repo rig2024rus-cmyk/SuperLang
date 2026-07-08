@@ -1,0 +1,26 @@
+relation parent(child, parent)
+
+input {
+    parent(alice, bob)
+    parent(bob, charlie)
+    parent(alice, david)
+    parent(eve, eve)
+}
+
+# 1. Ground query (True)
+query parent(alice, bob)       # → TRUE
+
+# 2. Ground query (False)
+query parent(charlie, alice)   # → FALSE
+
+# 3. Single variable
+query parent(alice, X)         # → [bob, david]
+
+# 4. Unification test (X must equal Y)
+query parent(X, X)             # → [eve]
+
+# 5. Multiple variables
+query parent(X, Y)             # → [(alice, bob), (bob, charlie), (alice, david), (eve, eve)]
+
+# 6. No results
+query parent(charlie, X)       # → []

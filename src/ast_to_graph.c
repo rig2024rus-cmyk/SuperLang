@@ -69,18 +69,24 @@ static Expr *copy_expr(const Expr *e) {
     return NULL;
 }
 
+/* Deep copy a comparison (v0.8) */
+static Comparison copy_comparison(const Comparison *c) {
+    Comparison result;
+    result.left = copy_expr(c->left);
+    result.op = c->op;
+    result.right = copy_expr(c->right);
+    result.loc = c->loc;
+    return result;
+}
+
 static void node_set_head_params(Node *n, char **params, int param_count) {
-    if (n->head_param_count > 0) return; /* only set once */
+    if (n->head_param_count > 0) return;
     n->head_params = malloc(sizeof(char*) * param_count);
     n->head_param_count = param_count;
     for (int i = 0; i < param_count; i++) {
         n->head_params[i] = strdup(params[i]);
     }
 }
-
-/* ====================================================================== */
-/* Create BASE edge with identity bindings                                */
-/* ====================================================================== */
 
 static void add_base_edge(Graph *g, Node *head, Node *impl, char **params, int param_count) {
     Edge *e = calloc(1, sizeof(Edge));
@@ -92,22 +98,18 @@ static void add_base_edge(Graph *g, Node *head, Node *impl, char **params, int p
     e->arith_result_var = NULL;
     e->atom_args = NULL;
     e->atom_arg_count = 0;
+    e->comparisons = NULL;
+    e->comparison_count = 0;
     e->next = NULL;
-    
     e->var_bindings = malloc(sizeof(EdgeVarBinding) * param_count);
     e->var_binding_count = param_count;
     for (int j = 0; j < param_count; j++) {
         e->var_bindings[j].var_name = strdup(params[j]);
         e->var_bindings[j].arg_index = j;
     }
-    
     append_edge(head, e);
     g->edge_count++;
 }
-
-/* ====================================================================== */
-/* Add condition edges to a target node (impl)                            */
-/* ====================================================================== */
 
 static void add_condition_edges(Graph *g, const char *target_name,
                                 const Condition *cond,
@@ -117,7 +119,6 @@ static void add_condition_edges(Graph *g, const char *target_name,
     for (int i = 0; i < cond->atom_count; i++) {
         const Atom *atom = &cond->atoms[i];
         if (atom->negated || atom->aggregate_func) continue;
-        
         EdgeType edge_type;
         if (string_set_contains(base_relations, atom->predicate) ||
             string_set_contains(derived_predicates, atom->predicate)) {
@@ -127,7 +128,6 @@ static void add_condition_edges(Graph *g, const char *target_name,
             string_set_add(base_relations, atom->predicate);
             edge_type = EDGE_DEFINED_BY_COMPOSITION;
         }
-        
         Node *from = graph_find_node(g, target_name);
         Node *to = graph_find_node(g, atom->predicate);
         if (from && to) {
@@ -138,21 +138,20 @@ static void add_condition_edges(Graph *g, const char *target_name,
             e->aggregate_field = -1;
             e->arith_expr = NULL;
             e->arith_result_var = NULL;
+            e->comparisons = NULL;
+            e->comparison_count = 0;
             e->next = NULL;
-            
             e->var_bindings = malloc(sizeof(EdgeVarBinding) * atom->arg_count);
             e->var_binding_count = atom->arg_count;
             for (int j = 0; j < atom->arg_count; j++) {
                 e->var_bindings[j].var_name = strdup(atom->args[j]);
                 e->var_bindings[j].arg_index = j;
             }
-            
             e->atom_args = malloc(sizeof(char*) * atom->arg_count);
             e->atom_arg_count = atom->arg_count;
             for (int j = 0; j < atom->arg_count; j++) {
                 e->atom_args[j] = strdup(atom->args[j]);
             }
-            
             append_edge(from, e);
             g->edge_count++;
         }
@@ -162,13 +161,11 @@ static void add_condition_edges(Graph *g, const char *target_name,
     for (int i = 0; i < cond->atom_count; i++) {
         const Atom *atom = &cond->atoms[i];
         if (!atom->negated) continue;
-        
         if (!string_set_contains(base_relations, atom->predicate) &&
             !string_set_contains(derived_predicates, atom->predicate)) {
             graph_add_node(g, atom->predicate, atom->arg_count, NODE_BASE);
             string_set_add(base_relations, atom->predicate);
         }
-        
         Node *from = graph_find_node(g, target_name);
         Node *to = graph_find_node(g, atom->predicate);
         if (from && to) {
@@ -179,21 +176,20 @@ static void add_condition_edges(Graph *g, const char *target_name,
             e->aggregate_field = -1;
             e->arith_expr = NULL;
             e->arith_result_var = NULL;
+            e->comparisons = NULL;
+            e->comparison_count = 0;
             e->next = NULL;
-            
             e->var_bindings = malloc(sizeof(EdgeVarBinding) * atom->arg_count);
             e->var_binding_count = atom->arg_count;
             for (int j = 0; j < atom->arg_count; j++) {
                 e->var_bindings[j].var_name = strdup(atom->args[j]);
                 e->var_bindings[j].arg_index = j;
             }
-            
             e->atom_args = malloc(sizeof(char*) * atom->arg_count);
             e->atom_arg_count = atom->arg_count;
             for (int j = 0; j < atom->arg_count; j++) {
                 e->atom_args[j] = strdup(atom->args[j]);
             }
-            
             append_edge(from, e);
             g->edge_count++;
         }
@@ -203,13 +199,11 @@ static void add_condition_edges(Graph *g, const char *target_name,
     for (int i = 0; i < cond->atom_count; i++) {
         const Atom *atom = &cond->atoms[i];
         if (!atom->aggregate_func) continue;
-        
         if (!string_set_contains(base_relations, atom->predicate) &&
             !string_set_contains(derived_predicates, atom->predicate)) {
             graph_add_node(g, atom->predicate, atom->arg_count - 1, NODE_BASE);
             string_set_add(base_relations, atom->predicate);
         }
-        
         Node *from = graph_find_node(g, target_name);
         Node *to = graph_find_node(g, atom->predicate);
         if (from && to) {
@@ -224,6 +218,8 @@ static void add_condition_edges(Graph *g, const char *target_name,
             e->var_binding_count = 0;
             e->atom_args = NULL;
             e->atom_arg_count = 0;
+            e->comparisons = NULL;
+            e->comparison_count = 0;
             e->next = NULL;
             append_edge(from, e);
             g->edge_count++;
@@ -233,10 +229,8 @@ static void add_condition_edges(Graph *g, const char *target_name,
     /* Process arithmetic assignments */
     for (int i = 0; i < cond->arith_count; i++) {
         const ArithAssignment *a = &cond->arith_assigns[i];
-        
         Node *from = graph_find_node(g, target_name);
         if (!from) continue;
-        
         Edge *e = calloc(1, sizeof(Edge));
         e->target = from;
         e->type = EDGE_DEFINED_BY_ARITHMETIC;
@@ -248,15 +242,39 @@ static void add_condition_edges(Graph *g, const char *target_name,
         e->var_binding_count = 0;
         e->atom_args = NULL;
         e->atom_arg_count = 0;
+        e->comparisons = NULL;
+        e->comparison_count = 0;
         e->next = NULL;
         append_edge(from, e);
         g->edge_count++;
     }
+    
+    /* Process comparisons (FILTER edge) - v0.8 */
+    if (cond->comparison_count > 0) {
+        Node *from = graph_find_node(g, target_name);
+        if (from) {
+            Edge *e = calloc(1, sizeof(Edge));
+            e->target = from;  /* Filter edge points to self */
+            e->type = EDGE_DEFINED_BY_FILTER;
+            e->aggregate_func = NULL;
+            e->aggregate_field = -1;
+            e->arith_expr = NULL;
+            e->arith_result_var = NULL;
+            e->var_bindings = NULL;
+            e->var_binding_count = 0;
+            e->atom_args = NULL;
+            e->atom_arg_count = 0;
+            e->comparison_count = cond->comparison_count;
+            e->comparisons = malloc(sizeof(Comparison) * cond->comparison_count);
+            for (int i = 0; i < cond->comparison_count; i++) {
+                e->comparisons[i] = copy_comparison(&cond->comparisons[i]);
+            }
+            e->next = NULL;
+            append_edge(from, e);
+            g->edge_count++;
+        }
+    }
 }
-
-/* ====================================================================== */
-/* Impl counter: unique IDs per head name                                 */
-/* ====================================================================== */
 
 typedef struct {
     char *name;
@@ -279,10 +297,6 @@ static int impl_next_id(ImplCounter **counters, int *counter_count, int *counter
     return 0;
 }
 
-/* ====================================================================== */
-/* Main translation                                                       */
-/* ====================================================================== */
-
 TranslationResult ast_to_graph_translate(const Program *program) {
     TranslationResult result;
     result.graph = graph_new();
@@ -290,26 +304,22 @@ TranslationResult ast_to_graph_translate(const Program *program) {
     result.error_message = NULL;
     result.error_line = 0;
     result.error_column = 0;
-    
     if (!program) {
         result.is_valid = 0;
         result.error_message = strdup("Program is NULL");
         return result;
     }
-    
     StringSet base_relations;
     StringSet derived_predicates;
     string_set_init(&base_relations);
     string_set_init(&derived_predicates);
     
-    /* STEP 1: Create base relation nodes */
     for (int i = 0; i < program->relation_count; i++) {
         const RelationDecl *r = &program->relations[i];
         graph_add_node(result.graph, r->name, r->param_count, NODE_BASE);
         string_set_add(&base_relations, r->name);
     }
     
-    /* STEP 2: Create head-Nodes for all unique derive names */
     for (int i = 0; i < program->derive_count; i++) {
         const DeriveDecl *d = &program->derives[i];
         Node *n = graph_add_node(result.graph, d->name, d->param_count, NODE_DERIVED);
@@ -317,7 +327,6 @@ TranslationResult ast_to_graph_translate(const Program *program) {
         string_set_add(&derived_predicates, d->name);
     }
     
-    /* STEP 3: Create head-Nodes for all unique observe names */
     for (int i = 0; i < program->observe_count; i++) {
         const ObserveDecl *o = &program->observes[i];
         Node *n = graph_add_node(result.graph, o->name, o->param_count, NODE_DERIVED);
@@ -325,65 +334,52 @@ TranslationResult ast_to_graph_translate(const Program *program) {
         string_set_add(&derived_predicates, o->name);
     }
     
-    /* STEP 4: For each DeriveDecl, create impl-Node + BASE edge + conditions */
     ImplCounter *counters = NULL;
     int counter_count = 0;
     int counter_cap = 0;
     
     for (int i = 0; i < program->derive_count; i++) {
         const DeriveDecl *d = &program->derives[i];
-        
-        if (d->condition.atom_count == 0 && d->condition.arith_count == 0) {
-            continue; /* empty body — skip */
+        if (d->condition.atom_count == 0 && 
+            d->condition.arith_count == 0 && 
+            d->condition.comparison_count == 0) {
+            continue;
         }
-        
         int id = impl_next_id(&counters, &counter_count, &counter_cap, d->name);
         char impl_name[256];
         snprintf(impl_name, sizeof(impl_name), "%s_impl_%d", d->name, id);
-        
         Node *impl_node = graph_add_node(result.graph, impl_name, d->param_count, NODE_DERIVED);
         node_set_head_params(impl_node, d->params, d->param_count);
-        
         Node *head_node = graph_find_node(result.graph, d->name);
         add_base_edge(result.graph, head_node, impl_node, d->params, d->param_count);
-        
         add_condition_edges(result.graph, impl_name, &d->condition,
-                           &base_relations, &derived_predicates);
-        
+                            &base_relations, &derived_predicates);
         string_set_add(&derived_predicates, impl_name);
     }
     
-    /* STEP 5: Same for observes */
     for (int i = 0; i < program->observe_count; i++) {
         const ObserveDecl *o = &program->observes[i];
-        
-        if (o->condition.atom_count == 0 && o->condition.arith_count == 0) {
+        if (o->condition.atom_count == 0 && 
+            o->condition.arith_count == 0 && 
+            o->condition.comparison_count == 0) {
             continue;
         }
-        
         int id = impl_next_id(&counters, &counter_count, &counter_cap, o->name);
         char impl_name[256];
         snprintf(impl_name, sizeof(impl_name), "%s_impl_%d", o->name, id);
-        
         Node *impl_node = graph_add_node(result.graph, impl_name, o->param_count, NODE_DERIVED);
         node_set_head_params(impl_node, o->params, o->param_count);
-        
         Node *head_node = graph_find_node(result.graph, o->name);
         add_base_edge(result.graph, head_node, impl_node, o->params, o->param_count);
-        
         add_condition_edges(result.graph, impl_name, &o->condition,
-                           &base_relations, &derived_predicates);
-        
+                            &base_relations, &derived_predicates);
         string_set_add(&derived_predicates, impl_name);
     }
     
-    /* Cleanup counters */
     for (int i = 0; i < counter_count; i++) free(counters[i].name);
     free(counters);
-    
     string_set_free(&base_relations);
     string_set_free(&derived_predicates);
-    
     return result;
 }
 

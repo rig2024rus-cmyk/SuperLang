@@ -62,6 +62,7 @@ const char *token_type_str(TokenType t) {
         case TOK_MINUS: return "MINUS";
         case TOK_STAR: return "STAR";
         case TOK_SLASH: return "SLASH";
+        case TOK_MODULO: return "MODULO";
         case TOK_EOF: return "EOF";
     }
     return "?";
@@ -115,6 +116,20 @@ static void lexer_skip_whitespace(Lexer *l) {
 
 static void lexer_skip_comment(Lexer *l) {
     while (l->pos < l->length && lexer_peek(l, 0) != '\n') {
+        lexer_advance(l);
+    }
+}
+
+static void lexer_skip_multiline_comment(Lexer *l) {
+    while (l->pos < l->length) {
+        if (lexer_peek(l, 0) == '-' &&
+            lexer_peek(l, 1) == '-' &&
+            lexer_peek(l, 2) == ']') {
+            lexer_advance(l);
+            lexer_advance(l);
+            lexer_advance(l);
+            return;
+        }
         lexer_advance(l);
     }
 }
@@ -216,13 +231,31 @@ TokenList lexer_tokenize(const char *source) {
         int start_line = l.line;
         int start_col = l.column;
         
-        /* Comments */
         if (ch == '#') {
             lexer_skip_comment(&l);
             continue;
         }
         
-        /* Identifiers / keywords */
+        if (ch == '[' && lexer_peek(&l, 1) == '-' && lexer_peek(&l, 2) == '-') {
+            lexer_advance(&l);
+            lexer_advance(&l);
+            lexer_advance(&l);
+            lexer_skip_multiline_comment(&l);
+            continue;
+        }
+        
+        if (ch == '!' && (isalpha(lexer_peek(&l, 1)) || lexer_peek(&l, 1) == '_')) {
+            lexer_advance(&l);
+            char *ident = lexer_read_identifier(&l);
+            size_t len = strlen(ident);
+            char *full = malloc(len + 2);
+            full[0] = '!';
+            memcpy(full + 1, ident, len + 1);
+            free(ident);
+            token_list_add(&list, TOK_IDENT, full, start_line, start_col);
+            continue;
+        }
+        
         if (isalpha(ch) || ch == '_') {
             char *word = lexer_read_identifier(&l);
             TokenType type = lookup_keyword(word);
@@ -230,21 +263,18 @@ TokenList lexer_tokenize(const char *source) {
             continue;
         }
         
-        /* Numbers */
         if (isdigit(ch)) {
             char *num = lexer_read_number(&l);
             token_list_add(&list, TOK_NUMBER, num, start_line, start_col);
             continue;
         }
         
-        /* Strings */
         if (ch == '"') {
             char *str = lexer_read_string(&l);
             token_list_add(&list, TOK_STRING, str, start_line, start_col);
             continue;
         }
         
-        /* Two-character operators (must be checked BEFORE single-char) */
         if (ch == '=' && lexer_peek(&l, 1) == '=') {
             lexer_advance(&l); lexer_advance(&l);
             token_list_add(&list, TOK_EQUALS, strdup("=="), start_line, start_col);
@@ -266,7 +296,6 @@ TokenList lexer_tokenize(const char *source) {
             continue;
         }
         
-        /* Single-character tokens */
         if (ch == '(') { lexer_advance(&l); token_list_add(&list, TOK_LPAREN, strdup("("), start_line, start_col); continue; }
         if (ch == ')') { lexer_advance(&l); token_list_add(&list, TOK_RPAREN, strdup(")"), start_line, start_col); continue; }
         if (ch == '{') { lexer_advance(&l); token_list_add(&list, TOK_LBRACE, strdup("{"), start_line, start_col); continue; }
@@ -279,8 +308,8 @@ TokenList lexer_tokenize(const char *source) {
         if (ch == '-') { lexer_advance(&l); token_list_add(&list, TOK_MINUS, strdup("-"), start_line, start_col); continue; }
         if (ch == '*') { lexer_advance(&l); token_list_add(&list, TOK_STAR, strdup("*"), start_line, start_col); continue; }
         if (ch == '/') { lexer_advance(&l); token_list_add(&list, TOK_SLASH, strdup("/"), start_line, start_col); continue; }
+        if (ch == '%') { lexer_advance(&l); token_list_add(&list, TOK_MODULO, strdup("%"), start_line, start_col); continue; }
         
-        /* Unknown character */
         lexer_advance(&l);
         char msg[128];
         snprintf(msg, sizeof(msg), "Unexpected character '%c'", ch);
@@ -288,9 +317,7 @@ TokenList lexer_tokenize(const char *source) {
         break;
     }
     
-    /* EOF token */
     token_list_add(&list, TOK_EOF, strdup(""), l.line, l.column);
-    
     return list;
 }
 

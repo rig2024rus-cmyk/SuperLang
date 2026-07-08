@@ -1,0 +1,12 @@
+relation order(id, total)
+
+input {
+    order(o1, 500)
+    order(o2, 1500)
+    order(o3, 2000)
+    order(o4, 100)
+}
+
+derive high_value(id) from order(id, total), total > 1000
+
+query high_value(!X)

@@ -17,7 +17,8 @@ typedef enum {
     EDGE_DEFINED_BY_COMPOSITION,
     EDGE_DEFINED_BY_NEGATION,
     EDGE_DEFINED_BY_AGGREGATE,
-    EDGE_DEFINED_BY_ARITHMETIC
+    EDGE_DEFINED_BY_ARITHMETIC,
+    EDGE_DEFINED_BY_FILTER
 } EdgeType;
 
 typedef struct {
@@ -32,13 +33,12 @@ typedef struct Edge {
     int aggregate_field;
     Expr *arith_expr;
     char *arith_result_var;
-    
     EdgeVarBinding *var_bindings;
     int var_binding_count;
-    
     char **atom_args;
     int atom_arg_count;
-    
+    Comparison *comparisons;
+    int comparison_count;
     struct Edge *next;
 } Edge;
 
@@ -46,11 +46,8 @@ typedef struct Node {
     char *name;
     int arity;
     NodeType type;
-    
-    /* Head parameter names (only for derived/observation nodes) */
     char **head_params;
     int head_param_count;
-    
     Edge *outgoing;
     struct Node *next;
 } Node;
