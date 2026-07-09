@@ -3,3 +3,4 @@
 
 
 [![Version](https://img.shields.io/badge/version-0.9-blue.svg)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.1-blue.svg)](./CHANGELOG.md)
