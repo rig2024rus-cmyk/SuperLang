@@ -1,22 +1,29 @@
-# Test 3: Task dependencies
-# A task is blocked if any dependency is not finished
+# Тест stratified negation с copy-правилами
+# Критический баг v1.1.1 — copy-правило получало stratum 0
+# и отрабатывало до того, как impl-правило что-то вывело
 
-entity Task
-relation Depends(Task, Task)
-relation Finished(Task)
-
-derive blocked(t)
-  from Depends(t, dep), not Finished(dep)
+relation task(id)
+relation depends(src, dst)
+relation finished(id)
 
 input {
-  Task(T1)
-  Task(T2)
-  Task(T3)
-  Depends(T2, T1)
-  Depends(T3, T2)
-  Finished(T1)
+    task(T1)
+    task(T2)
+    task(T3)
+    depends(T3, T2)
+    depends(T2, T1)
+    finished(T1)
 }
 
-query blocked(T1)
-query blocked(T2)
-query blocked(T3)
+# blocked(X) = X зависит от чего-то, что не finished
+derive blocked(id) from
+    depends(id, dep),
+    not finished(dep)
+
+# ready(X) = X не blocked
+derive ready(id) from
+    task(id),
+    not blocked(id)
+
+query blocked(!ID)
+query ready(!ID)

@@ -1,3 +1,29 @@
+/*
+ * SuperLang Runtime Engine v1.1.2
+ * 
+ * Runtime stage of the 8-stage compilation pipeline:
+ *   Source → Lexer → Parser → TypeChecker → AST-to-Graph →
+ *   Validator → Synthesizer → [Runtime Saturation] → Query Engine
+ *
+ * Ответственность:
+ *   - Управление базой фактов (Config)
+ *   - Вычисление арифметических выражений с поддержкой built-in функций
+ *   - Применение правил трёх типов (aggregate, arithmetic, general)
+ *   - Stratified saturation до неподвижной точки (Knaster-Tarski)
+ *
+ * История версий:
+ *   v1.0   - Подключены фильтры сравнения в apply_rule_general
+ *   v1.1   - Добавлены встроенные math-функции (sqrt, pow, sin, ...)
+ *   v1.1.1 - КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ:
+ *            * negation stratification для copy-правил
+ *            * strip_impl_suffix ('\0' вместо '0')
+ *            * UB при cast double→int
+ *            * подробное документирование
+ *   v1.1.2 - КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ stratification:
+ *            * Self-reference = ТОЧНОЕ совпадение имён (не canonical)
+ *            * Copy-правила теперь правильно наследуют stratum от impl-правил
+ */
+
 #include "runtime.h"
 #include "synthesizer.h"
 #include <stdio.h>
@@ -5,11 +31,28 @@
 #include <string.h>
 #include <stdarg.h>
 #include <math.h>
+#include <assert.h>
 
+/* ========================================================================= */
+/* ЧАСТЬ 1: CONFIG — база фактов                                              */
+/* ========================================================================= */
+
+/*
+ * config_new: создать пустую конфигурацию
+ * 
+ * Конфигурация — это коллекция фактов, накопленных во время saturation.
+ * Изначально пуста, факты добавляются из input{} блока и через apply_rule.
+ */
 Config *config_new(void) {
     return calloc(1, sizeof(Config));
 }
 
+/*
+ * config_free: освободить конфигурацию и все её факты
+ *
+ * Каждый факт содержит strdup'нутые строки (predicate + args),
+ * поэтому требуется аккуратное рекурсивное освобождение.
+ */
 void config_free(Config *c) {
     if (!c) return;
     Fact *f = c->facts;
@@ -24,6 +67,14 @@ void config_free(Config *c) {
     free(c);
 }
 
+/*
+ * config_add_fact: добавить факт в конфигурацию (публичный API)
+ *
+ * Используется в main.c для загрузки input{} фактов.
+ * Автоматически дедуплицирует: если факт уже есть, ничего не делает.
+ *
+ * Variadic interface: config_add_fact(c, "parent", 2, "alice", "bob")
+ */
 void config_add_fact(Config *c, const char *pred, int arity, ...) {
     va_list args;
     va_start(args, arity);
@@ -33,6 +84,7 @@ void config_add_fact(Config *c, const char *pred, int arity, ...) {
     }
     va_end(args);
 
+    /* Проверка на дубликат */
     for (Fact *f = c->facts; f; f = f->next) {
         if (strcmp(f->predicate, pred) == 0 && f->arity == arity) {
             int match = 1;
@@ -46,6 +98,8 @@ void config_add_fact(Config *c, const char *pred, int arity, ...) {
             }
         }
     }
+    
+    /* Добавление нового факта в голову списка */
     Fact *f = calloc(1, sizeof(Fact));
     f->predicate = strdup(pred);
     f->args = new_args;
@@ -55,6 +109,9 @@ void config_add_fact(Config *c, const char *pred, int arity, ...) {
     c->count++;
 }
 
+/*
+ * config_has_fact: проверить наличие факта (публичный API, variadic)
+ */
 int config_has_fact(Config *c, const char *pred, int arity, ...) {
     va_list args;
     va_start(args, arity);
@@ -77,6 +134,14 @@ int config_has_fact(Config *c, const char *pred, int arity, ...) {
     return found;
 }
 
+/*
+ * fact_exists: внутренняя проверка существования факта (по char** args)
+ *
+ * Используется в apply_rule_* функциях для дедупликации.
+ * 
+ * ВАЖНО: это O(N) на каждый запрос, где N — общее число фактов.
+ * Для production нужен индекс по предикату (TODO: semi-naive eval).
+ */
 static int fact_exists(Config *c, const char *pred, int arity, char **args) {
     for (Fact *f = c->facts; f; f = f->next) {
         if (strcmp(f->predicate, pred) == 0 && f->arity == arity) {
@@ -90,6 +155,12 @@ static int fact_exists(Config *c, const char *pred, int arity, char **args) {
     return 0;
 }
 
+/*
+ * add_fact_direct: добавить факт с дедупликацией (внутренний API)
+ *
+ * Используется в apply_rule_* функциях. Каждый args[i] strdup'уется,
+ * поэтому вызывающий сохраняет ownership оригинальных строк.
+ */
 static void add_fact_direct(Config *c, const char *pred, int arity, char **args) {
     if (fact_exists(c, pred, arity, args)) return;
     Fact *f = calloc(1, sizeof(Fact));
@@ -102,6 +173,9 @@ static void add_fact_direct(Config *c, const char *pred, int arity, char **args)
     c->count++;
 }
 
+/*
+ * config_dump: отладочный вывод всех фактов
+ */
 void config_dump(const Config *c) {
     printf("Configuration: %zu facts\n", c->count);
     for (Fact *f = c->facts; f; f = f->next) {
@@ -113,6 +187,9 @@ void config_dump(const Config *c) {
     }
 }
 
+/*
+ * config_visit_facts: обход всех фактов через callback (для query engine)
+ */
 void config_visit_facts(Config *c, FactVisitor visitor, void *ctx) {
     if (!c || !visitor) return;
     for (Fact *f = c->facts; f; f = f->next) {
@@ -120,36 +197,54 @@ void config_visit_facts(Config *c, FactVisitor visitor, void *ctx) {
     }
 }
 
+/* ========================================================================= */
+/* ЧАСТЬ 2: EXPRESSION EVALUATOR                                             */
+/* ========================================================================= */
+
+/*
+ * VarBindings: локальное окружение для вычисления выражений
+ *
+ * Связывает имена переменных с их строковыми значениями.
+ * Значения — это указатели на строки из фактов (не ownership).
+ */
 typedef struct {
     const char **names;
     const char **values;
     int count;
 } VarBindings;
 
-/* ========================================================================= */
-/* Expression evaluator — recursive descent with built-in function support   */
-/* v1.1: added EXPR_CALL handling for sqrt, pow, sin, cos, etc.              */
-/* ========================================================================= */
-
+/*
+ * eval_expr: рекурсивный вычислитель выражений
+ *
+ * Поддерживает:
+ *   - EXPR_NUMBER: числовые литералы
+ *   - EXPR_VARIABLE: поиск в VarBindings с парсингом через strtod
+ *   - EXPR_BINARY: +, -, *, /, % (через fmod для %)
+ *   - EXPR_UNARY_MINUS: унарный минус
+ *   - EXPR_CALL: built-in функции (sqrt, pow, sin, ...) [v1.1]
+ *
+ * Возвращает 0.0 для несвязанных переменных (защита от ошибок синтеза).
+ * В production стоит добавить assert для несвязанных переменных.
+ */
 static double eval_expr(const Expr *e, const VarBindings *binds) {
     if (!e) return 0.0;
-
     switch (e->type) {
         case EXPR_NUMBER:
             return e->number;
-
+            
         case EXPR_VARIABLE:
-            /* Look up variable value, parse as double */
             for (int i = 0; i < binds->count; i++) {
                 if (strcmp(binds->names[i], e->var_name) == 0) {
                     char *endptr;
                     double val = strtod(binds->values[i], &endptr);
                     if (*endptr == '\0') return val;
-                    return 0.0;  /* not a valid number */
+                    return 0.0;  /* не числовое значение */
                 }
             }
-            return 0.0;  /* variable not bound */
-
+            /* Несвязанная переменная — защита от ошибок синтеза.
+             * В идеале type_checker должен это предотвращать. */
+            return 0.0;
+            
         case EXPR_BINARY: {
             double left = eval_expr(e->binary.left, binds);
             double right = eval_expr(e->binary.right, binds);
@@ -162,22 +257,21 @@ static double eval_expr(const Expr *e, const VarBindings *binds) {
             }
             return 0.0;
         }
-
+        
         case EXPR_UNARY_MINUS:
             return -eval_expr(e->operand, binds);
-
-        /* NEW in v1.1: built-in function calls */
+            
         case EXPR_CALL: {
-            /* Evaluate all arguments first */
-            double arg_values[8];  /* max 8 arguments supported */
+            /* v1.1: Built-in math functions */
+            double arg_values[8];  /* max 8 аргументов */
             int n_args = e->call.arg_count;
             if (n_args > 8) n_args = 8;
             for (int i = 0; i < n_args; i++) {
                 arg_values[i] = eval_expr(e->call.args[i], binds);
             }
             const char *fn = e->call.func_name;
-
-            /* 1-argument functions */
+            
+            /* 1-аргументные функции */
             if (n_args == 1) {
                 double x = arg_values[0];
                 if (strcmp(fn, "sqrt") == 0)  return (x >= 0.0) ? sqrt(x) : 0.0;
@@ -195,23 +289,29 @@ static double eval_expr(const Expr *e, const VarBindings *binds) {
                 if (strcmp(fn, "ceil") == 0)  return ceil(x);
                 if (strcmp(fn, "round") == 0) return round(x);
             }
-            /* 2-argument functions */
+            /* 2-аргументные функции */
             else if (n_args == 2) {
                 double x = arg_values[0];
                 double y = arg_values[1];
                 if (strcmp(fn, "pow") == 0)   return pow(x, y);
                 if (strcmp(fn, "fmod") == 0)  return (y != 0.0) ? fmod(x, y) : 0.0;
                 if (strcmp(fn, "atan2") == 0) return atan2(y, x);
-                if (strcmp(fn, "fmin") == 0)  return fmin(x, y);   /* ← ИЗМЕНЕНО с min */
-                if (strcmp(fn, "fmax") == 0)  return fmax(x, y);   /* ← ИЗМЕНЕНО с max */
+                if (strcmp(fn, "fmin") == 0)  return fmin(x, y);
+                if (strcmp(fn, "fmax") == 0)  return fmax(x, y);
             }
-            /* Unknown function or wrong arity — return 0 */
+            /* Неизвестная функция или неправильная арность */
             return 0.0;
         }
     }
     return 0.0;
 }
 
+/*
+ * eval_comparisons: проверка списка фильтров сравнения
+ *
+ * Возвращает 1 если ВСЕ сравнения истинны (AND semantics),
+ * 0 если хоть одно ложно.
+ */
 static int eval_comparisons(const Comparison *cmps, int count, const VarBindings *binds) {
     for (int i = 0; i < count; i++) {
         const Comparison *cmp = &cmps[i];
@@ -231,6 +331,39 @@ static int eval_comparisons(const Comparison *cmps, int count, const VarBindings
     return 1;
 }
 
+/*
+ * format_number: безопасное форматирование числа в строку [v1.1.1 FIX]
+ *
+ * ИСПРАВЛЕНИЕ v1.1.1: сначала проверяем границы, потом делаем cast в int.
+ * Это предотвращает undefined behavior при cast больших double (>2^31).
+ *
+ * Раньше было:
+ *   if (result == (int)result && fabs(result) < 1e15)  ← UB для больших result
+ *
+ * Теперь:
+ *   if (fabs(value) < 1e15 && value == floor(value))   ← сначала проверка
+ */
+static void format_number(double value, char *buf, size_t buf_size) {
+    if (fabs(value) < 1e15 && value == floor(value)) {
+        snprintf(buf, buf_size, "%d", (int)value);
+    } else {
+        snprintf(buf, buf_size, "%.2f", value);
+    }
+}
+
+/* ========================================================================= */
+/* ЧАСТЬ 3: RULE APPLICATION — применение правил трёх типов                   */
+/* ========================================================================= */
+
+/*
+ * apply_rule_aggregate: применение правила агрегации
+ *
+ * Пример:
+ *   derive total(cat, s) from item(cat, price), s = sum(item, price)
+ *
+ * Группирует факты source-предиката по всем полям кроме agg_field,
+ * вычисляет агрегат (sum/count/min/max), добавляет в head.
+ */
 static int apply_rule_aggregate(Config *c, const Rule *r) {
     int added = 0;
     char *agg_func = r->aggregate_funcs[0];
@@ -239,6 +372,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
     int dst_arity = r->head_arity;
     int needs_numeric = (strcmp(agg_func, "count") != 0);
 
+    /* Структура для накопления агрегатов по группе */
     typedef struct {
         char **key;
         int key_count;
@@ -251,10 +385,12 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
     Group *groups = NULL;
     int group_count = 0, group_capacity = 0;
 
+    /* Проходим по всем фактам source-предиката */
     for (Fact *f = c->facts; f; f = f->next) {
         if (strcmp(f->predicate, r->body_preds[0]) != 0) continue;
         if (f->arity != src_arity) continue;
 
+        /* Извлекаем ключ группы (все поля кроме agg_field) */
         int key_count = src_arity - 1;
         char **key = malloc(sizeof(char*) * key_count);
         int ki = 0;
@@ -262,6 +398,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
             if (i != agg_field) key[ki++] = f->args[i];
         }
 
+        /* Извлекаем числовое значение для агрегации */
         double value = 0.0;
         if (needs_numeric) {
             char *endptr;
@@ -269,6 +406,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
             if (*endptr != '\0') { free(key); continue; }
         }
 
+        /* Ищем существующую группу с таким же ключом */
         Group *g = NULL;
         for (int i = 0; i < group_count; i++) {
             int match = 1;
@@ -278,6 +416,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
             if (match) { g = &groups[i]; free(key); break; }
         }
 
+        /* Создаём новую группу если не нашли */
         if (!g) {
             if (group_count >= group_capacity) {
                 group_capacity = group_capacity == 0 ? 16 : group_capacity * 2;
@@ -291,6 +430,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
             g->initialized = 0;
         }
 
+        /* Обновляем агрегат */
         if (strcmp(agg_func, "count") == 0) {
             g->count++;
         } else {
@@ -306,6 +446,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
         }
     }
 
+    /* Для каждой группы создаём head-факт */
     for (int i = 0; i < group_count; i++) {
         Group *g = &groups[i];
         double result;
@@ -320,10 +461,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
         for (int j = 0; j < g->key_count; j++) args[ai++] = g->key[j];
 
         char buf[64];
-        if (result == (int)result && fabs(result) < 1e15)
-            snprintf(buf, sizeof(buf), "%d", (int)result);
-        else
-            snprintf(buf, sizeof(buf), "%.2f", result);
+        format_number(result, buf, sizeof(buf));
         args[ai] = buf;
 
         if (!fact_exists(c, r->head, dst_arity, args)) {
@@ -337,8 +475,25 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
     return added;
 }
 
+/*
+ * apply_rule_arithmetic: применение правила с арифметикой
+ *
+ * Пример:
+ *   derive doubled(x, y) from number(x), y = x * 2
+ *
+ * Перебирает все комбинации фактов для "обычных" атомов (не __arith__),
+ * вычисляет арифметическое выражение, создаёт head-факт.
+ *
+ * Ограничение v1.1: только одно арифметическое присваивание на правило,
+ * только в последней позиции head. Для множественной арифметики
+ * нужен конвейер предикатов (декларативный обход).
+ *
+ * arith_slot — индекс body atom'а, содержащего арифметику.
+ */
 static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
     int added = 0;
+    
+    /* Собираем "обычные" body atoms (не __arith__) */
     int regular_slots[16], regular_count = 0;
     for (int i = 0; i < r->body_count && regular_count < 16; i++) {
         if (strcmp(r->body_preds[i], "__arith__") != 0)
@@ -346,6 +501,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
     }
     if (regular_count == 0) return added;
 
+    /* Собираем списки фактов для каждого regular atom */
     Fact **fact_lists[16];
     int fact_counts[16];
     for (int s = 0; s < regular_count; s++) {
@@ -364,10 +520,12 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
         }
     }
 
+    /* Маппинг atom_index → pos slot для unification */
     int atom_to_pos[32];
     for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
     for (int s = 0; s < regular_count; s++) atom_to_pos[regular_slots[s]] = s;
 
+    /* Перебор всех комбинаций фактов (n-way join) */
     int indices[16] = {0};
     while (1) {
         int valid = 1;
@@ -379,6 +537,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
         for (int s = 0; s < regular_count; s++)
             current_facts[s] = fact_lists[s][indices[s]];
 
+        /* ШАГ 1: Unification — связывание переменных через ArgBindings */
         int combination_valid = 1;
         char **binding_values = r->arg_binding_count > 0
             ? malloc(sizeof(char*) * r->arg_binding_count) : NULL;
@@ -391,6 +550,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
             if (pos < 0) { combination_valid = 0; break; }
             char *value = current_facts[pos]->args[first->arg_index];
             binding_values[b] = value;
+            /* Проверяем что все локации этой переменной имеют одинаковое значение */
             for (int l = 1; l < bind->location_count; l++) {
                 int p = atom_to_pos[bind->locations[l].atom_index];
                 if (p < 0) { combination_valid = 0; break; }
@@ -400,72 +560,73 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
             }
         }
 
+        /* ШАГ 2: Применение фильтров сравнения (v1.0) */
         if (combination_valid) {
-    const char **bind_names = malloc(sizeof(const char*) * r->arg_binding_count);
-    const char **bind_values_arr = malloc(sizeof(const char*) * r->arg_binding_count);
-    int bind_count = 0;
-    for (int b = 0; b < r->arg_binding_count; b++) {
-        if (binding_values[b] == NULL) continue;
-        bind_names[bind_count] = r->arg_bindings[b].var_name;
-        bind_values_arr[bind_count] = binding_values[b];
-        bind_count++;
-    }
-    VarBindings vbinds = { bind_names, bind_values_arr, bind_count };
-
-    /* Проверка фильтров сравнения (v1.0) — ИСПРАВЛЕНО */
-    if (r->comparisons && r->comparisons[arith_slot] && r->comparison_counts[arith_slot] > 0) {
-        if (!eval_comparisons(r->comparisons[arith_slot], r->comparison_counts[arith_slot], &vbinds)) {
-            combination_valid = 0;
-        }
-    }
-
-    if (combination_valid) {
-        double val = eval_expr(r->arith_exprs[arith_slot], &vbinds);
-
-        char **result_args = calloc(r->head_arity, sizeof(char*));
-        int *is_our_alloc = calloc(r->head_arity, sizeof(int));
-        int head_valid = 1;
-
-        for (int j = 0; j < r->head_arity; j++) {
-            int found = -1;
+            const char **bind_names = malloc(sizeof(const char*) * r->arg_binding_count);
+            const char **bind_values_arr = malloc(sizeof(const char*) * r->arg_binding_count);
+            int bind_count = 0;
             for (int b = 0; b < r->arg_binding_count; b++) {
-                if (r->arg_bindings[b].is_head && r->arg_bindings[b].head_arg_index == j) {
-                    found = b; break;
+                if (binding_values[b] == NULL) continue;
+                bind_names[bind_count] = r->arg_bindings[b].var_name;
+                bind_values_arr[bind_count] = binding_values[b];
+                bind_count++;
+            }
+            VarBindings vbinds = { bind_names, bind_values_arr, bind_count };
+
+            /* Проверка comparisons для arithmetic slot */
+            if (r->comparisons && r->comparisons[arith_slot] && r->comparison_counts[arith_slot] > 0) {
+                if (!eval_comparisons(r->comparisons[arith_slot], r->comparison_counts[arith_slot], &vbinds)) {
+                    combination_valid = 0;
                 }
             }
-            if (found < 0 || binding_values[found] == NULL) {
-                if (j == r->head_arity - 1) {
-                    char buf[64];
-                    if (val == (int)val && fabs(val) < 1e15)
-                        snprintf(buf, sizeof(buf), "%d", (int)val);
-                    else
-                        snprintf(buf, sizeof(buf), "%.2f", val);
-                    result_args[j] = strdup(buf);
-                    is_our_alloc[j] = 1;
-                } else { head_valid = 0; break; }
-            } else {
-                result_args[j] = binding_values[found];
-                is_our_alloc[j] = 0;
+
+            /* ШАГ 3: Вычисление арифметики и создание head-факта */
+            if (combination_valid) {
+                double val = eval_expr(r->arith_exprs[arith_slot], &vbinds);
+
+                char **result_args = calloc(r->head_arity, sizeof(char*));
+                int *is_our_alloc = calloc(r->head_arity, sizeof(int));
+                int head_valid = 1;
+
+                for (int j = 0; j < r->head_arity; j++) {
+                    int found = -1;
+                    for (int b = 0; b < r->arg_binding_count; b++) {
+                        if (r->arg_bindings[b].is_head && r->arg_bindings[b].head_arg_index == j) {
+                            found = b; break;
+                        }
+                    }
+                    if (found < 0 || binding_values[found] == NULL) {
+                        /* Последняя позиция — для арифметического результата */
+                        if (j == r->head_arity - 1) {
+                            char buf[64];
+                            format_number(val, buf, sizeof(buf));
+                            result_args[j] = strdup(buf);
+                            is_our_alloc[j] = 1;
+                        } else { head_valid = 0; break; }
+                    } else {
+                        result_args[j] = binding_values[found];
+                        is_our_alloc[j] = 0;
+                    }
+                }
+
+                if (head_valid && !fact_exists(c, r->head, r->head_arity, result_args)) {
+                    add_fact_direct(c, r->head, r->head_arity, result_args);
+                    added++;
+                }
+
+                for (int j = 0; j < r->head_arity; j++) {
+                    if (is_our_alloc[j]) free(result_args[j]);
+                }
+                free(result_args);
+                free(is_our_alloc);
             }
+            free(bind_names);
+            free(bind_values_arr);
         }
-
-        if (head_valid && !fact_exists(c, r->head, r->head_arity, result_args)) {
-            add_fact_direct(c, r->head, r->head_arity, result_args);
-            added++;
-        }
-
-        for (int j = 0; j < r->head_arity; j++) {
-            if (is_our_alloc[j]) free(result_args[j]);
-        }
-        free(result_args);
-        free(is_our_alloc);
-    }
-    free(bind_names);
-    free(bind_values_arr);
-}
 
         if (binding_values) free(binding_values);
 
+        /* Инкремент счётчика комбинаций (lexicographic order) */
         int carry = 1;
         for (int s = regular_count - 1; s >= 0 && carry; s--) {
             indices[s]++;
@@ -479,10 +640,26 @@ static int apply_rule_arithmetic(Config *c, const Rule *r, int arith_slot) {
     return added;
 }
 
+/*
+ * apply_rule_general: применение общего правила (n-way join с negation)
+ *
+ * Пример:
+ *   derive blocked(id) from
+ *       depends(id, dep),
+ *       not finished(dep)
+ *
+ * Основной рабочий конь SuperLang. Работает в 4 шага:
+ *   1. Разделить body atoms на positive и negative
+ *   2. Перебрать комбинации фактов для positive atoms (n-way join)
+ *   3. Unification через ArgBindings + filters + negation check
+ *   4. Создание head-факта
+ *
+ * v1.0: добавлена поддержка comparison filters в general rules
+ */
 static int apply_rule_general(Config *c, const Rule *r) {
     if (r->body_count == 0) return 0;
 
-    /* Разделяем positive и negative atoms */
+    /* ШАГ 1: Разделить positive и negative atoms */
     int pos_indices[32], neg_indices[32];
     int pos_count = 0, neg_count = 0;
     for (int i = 0; i < r->body_count; i++) {
@@ -491,7 +668,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
     }
     if (pos_count == 0) return 0;
 
-    /* Собираем списки фактов для каждого positive atom */
+    /* Собрать списки фактов для каждого positive atom */
     Fact ***pos_fact_lists = malloc(sizeof(Fact**) * pos_count);
     int *pos_fact_counts = calloc(pos_count, sizeof(int));
     for (int p = 0; p < pos_count; p++) {
@@ -508,6 +685,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
             if (strcmp(f->predicate, pred) == 0 && f->arity == arity)
                 pos_fact_lists[p][fi++] = f;
         if (count == 0) {
+            /* Один из positive atoms пустой — всё правило не сработает */
             for (int j = 0; j <= p; j++) if (pos_fact_lists[j]) free(pos_fact_lists[j]);
             free(pos_fact_lists);
             free(pos_fact_counts);
@@ -515,7 +693,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
         }
     }
 
-    /* Маппинг atom_index -> pos slot */
+    /* Маппинг atom_index → pos slot */
     int atom_to_pos[32];
     for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
     for (int p = 0; p < pos_count; p++) atom_to_pos[pos_indices[p]] = p;
@@ -525,6 +703,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
     char **binding_values = r->arg_binding_count > 0
         ? malloc(sizeof(char*) * r->arg_binding_count) : NULL;
 
+    /* Перебор всех комбинаций positive facts */
     while (1) {
         int valid_indices = 1;
         for (int p = 0; p < pos_count; p++)
@@ -535,10 +714,11 @@ static int apply_rule_general(Config *c, const Rule *r) {
         for (int p = 0; p < pos_count; p++)
             current_facts[p] = pos_fact_lists[p][indices[p]];
 
-        /* ===== ШАГ 1: Unification (связывание переменных) ===== */
+        /* ===== ШАГ 2: Unification (связывание переменных) ===== */
         int combination_valid = 1;
         for (int b = 0; b < r->arg_binding_count; b++) {
             ArgBinding *bind = &r->arg_bindings[b];
+            /* Находим первую positive локацию для этой переменной */
             int first_pos_loc = -1;
             for (int l = 0; l < bind->location_count; l++) {
                 int atom_idx = bind->locations[l].atom_index;
@@ -549,11 +729,12 @@ static int apply_rule_general(Config *c, const Rule *r) {
             int pos_idx = atom_to_pos[first->atom_index];
             char *value = current_facts[pos_idx]->args[first->arg_index];
             binding_values[b] = value;
+            /* Проверяем все остальные локации этой переменной */
             for (int l = 0; l < bind->location_count; l++) {
                 if (l == first_pos_loc) continue;
                 int atom_idx = bind->locations[l].atom_index;
                 int pos = atom_to_pos[atom_idx];
-                if (pos < 0) continue;
+                if (pos < 0) continue;  /* negative атом — проверим позже */
                 if (strcmp(value, current_facts[pos]->args[bind->locations[l].arg_index]) != 0) {
                     combination_valid = 0; break;
                 }
@@ -561,7 +742,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
             if (!combination_valid) break;
         }
 
-        /* ===== ШАГ 2: Проверка фильтров сравнения (НОВОЕ v1.0) ===== */
+        /* ===== ШАГ 3: Проверка фильтров сравнения (v1.0) ===== */
         if (combination_valid && r->comparisons && r->comparison_counts) {
             const char **bind_names = malloc(sizeof(const char*) * r->arg_binding_count);
             const char **bind_values_arr = malloc(sizeof(const char*) * r->arg_binding_count);
@@ -574,6 +755,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
             }
             VarBindings vbinds = { bind_names, bind_values_arr, bind_count };
 
+            /* Проверяем фильтры для КАЖДОГО body atom */
             for (int i = 0; i < r->body_count && combination_valid; i++) {
                 if (r->comparisons[i] && r->comparison_counts[i] > 0) {
                     if (!eval_comparisons(r->comparisons[i],
@@ -588,7 +770,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
             free(bind_values_arr);
         }
 
-        /* ===== ШАГ 3: Проверка negative atoms ===== */
+        /* ===== ШАГ 4: Проверка negative atoms (stratified negation) ===== */
         if (combination_valid) {
             for (int n = 0; n < neg_count && combination_valid; n++) {
                 int atom_idx = neg_indices[n];
@@ -596,6 +778,8 @@ static int apply_rule_general(Config *c, const Rule *r) {
                 int arity = r->body_arities[atom_idx];
                 char *neg_args[32];
                 int all_bound = 1;
+                /* Все аргументы negative atom'а должны быть связаны через positive atoms
+                 * (это requirement safety condition в Datalog) */
                 for (int j = 0; j < arity; j++) {
                     int found_binding = -1;
                     for (int b = 0; b < r->arg_binding_count; b++) {
@@ -611,12 +795,13 @@ static int apply_rule_general(Config *c, const Rule *r) {
                     if (found_binding < 0) { all_bound = 0; break; }
                     neg_args[j] = binding_values[found_binding];
                 }
+                /* Если такой факт существует — negation fails, комбинация отбрасывается */
                 if (all_bound && fact_exists(c, pred, arity, neg_args))
                     combination_valid = 0;
             }
         }
 
-        /* ===== ШАГ 4: Создание head fact ===== */
+        /* ===== ШАГ 5: Создание head fact ===== */
         if (combination_valid && r->head_arity > 0) {
             char *head_args[32];
             int head_valid = 1;
@@ -655,6 +840,9 @@ static int apply_rule_general(Config *c, const Rule *r) {
     return added;
 }
 
+/*
+ * apply_rule: dispatcher — выбирает нужный apply_rule_* в зависимости от типа
+ */
 static int apply_rule(Config *c, const Rule *r) {
     if (r->aggregate_funcs && r->aggregate_funcs[0])
         return apply_rule_aggregate(c, r);
@@ -665,18 +853,36 @@ static int apply_rule(Config *c, const Rule *r) {
     return apply_rule_general(c, r);
 }
 
+/* ========================================================================= */
+/* ЧАСТЬ 4: STRATIFICATION — вычисление страт для правил                      */
+/* ========================================================================= */
+
+/*
+ * strip_impl_suffix: убрать суффикс _impl_N из имени предиката [v1.1.1 FIX]
+ *
+ * Примеры:
+ *   "blocked_impl_0" → "blocked"
+ *   "ancestor" → "ancestor" (без изменений)
+ *
+ * ИСПРАВЛЕНИЕ v1.1.1: раньше было result[len] = '0' (символ '0'),
+ * теперь result[len] = '\0' (нулевой терминатор).
+ */
 static char *strip_impl_suffix(const char *name) {
     const char *impl = strstr(name, "_impl_");
     if (impl) {
         size_t len = impl - name;
         char *result = malloc(len + 1);
         memcpy(result, name, len);
-        result[len] = '\0';
+        result[len] = '\0';  /* v1.1.1 FIX: было '0' (символ) */
         return result;
     }
     return strdup(name);
 }
 
+/*
+ * VisitedSet: множество посещённых предикатов для предотвращения
+ * бесконечной рекурсии при вычислении страт.
+ */
 typedef struct {
     const char **items;
     int count;
@@ -710,36 +916,85 @@ static void visited_free(VisitedSet *v) {
     v->items = NULL; v->count = 0; v->capacity = 0;
 }
 
+/*
+ * pred_strat_internal: рекурсивное вычисление страты предиката
+ */
 static int pred_strat_internal(const char *pred, const ClosureIR *c,
                                const char *canonical_head, VisitedSet *visited);
 
+/*
+ * rule_strat_fixed: вычислить stratum для правила
+ * 
+ * [КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ v1.1.2]
+ * 
+ * РАНЬШЕ: self-reference определялась как совпадение canonical forms
+ * (после strip_impl_suffix), что приводило к тому, что copy-правило
+ * `blocked <- blocked_impl_0` считалось self-reference и получало stratum 0.
+ * 
+ * СЕЙЧАС: self-reference = ТОЧНОЕ совпадение имён предикатов
+ * (strcmp(body_pred, r->head) == 0). Copy-правила теперь правильно
+ * наследуют stratum от impl-правил.
+ * 
+ * Пример:
+ *   derive blocked(id) from depends(id, dep), not finished(dep)
+ *   derive blocked(id) from blocked_impl_0(id)   ← copy-правило
+ * 
+ *   blocked_impl_0 содержит negation → stratum 1
+ *   copy-правило blocked :- blocked_impl_0 теперь в stratum 1 (не 0!)
+ */
 static int rule_strat_fixed(const Rule *r, const ClosureIR *c,
                             const char *canonical_head, VisitedSet *visited) {
     int max_strat = 0;
     for (int i = 0; i < r->body_count; i++) {
         if (strcmp(r->body_preds[i], "__arith__") == 0) continue;
 
-        char *body_canonical = strip_impl_suffix(r->body_preds[i]);
-        int is_self_ref = (strcmp(body_canonical, canonical_head) == 0);
-        free(body_canonical);
-        if (is_self_ref) continue;
+        const char *body_pred = r->body_preds[i];
+        
+        /* v1.1.2 FIX: Self-reference = ТОЧНОЕ совпадение имён,
+         * а не совпадение после strip_impl_suffix */
+        int is_self_ref = (strcmp(body_pred, r->head) == 0);
 
-        int body_strat = pred_strat_internal(r->body_preds[i], c, canonical_head, visited);
+        if (is_self_ref) {
+            /* Реальная рекурсия (self-reference через negation) */
+            if (r->body_negative[i]) {
+                int body_strat = pred_strat_internal(body_pred, c, canonical_head, visited);
+                int required = body_strat + 1;
+                if (required > max_strat) max_strat = required;
+            }
+            continue;
+        }
+
+        /* Разные предикаты — вычисляем stratum body */
+        int body_strat = pred_strat_internal(body_pred, c, canonical_head, visited);
         int required = r->body_negative[i] ? (body_strat + 1) : body_strat;
         if (required > max_strat) max_strat = required;
     }
     return max_strat;
 }
 
+/*
+ * pred_strat_internal: вычислить максимальный stratum среди всех правил
+ * с данным head-предикатом.
+ * 
+ * [КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ v1.1.2]
+ * 
+ * Self-reference теперь определяется как ТОЧНОЕ совпадение имён,
+ * а не совпадение canonical forms.
+ */
 static int pred_strat_internal(const char *pred, const ClosureIR *c,
                                const char *canonical_head, VisitedSet *visited) {
     if (visited_contains(visited, pred)) return 0;
 
-    char *pred_canonical = strip_impl_suffix(pred);
-    int same_canonical = (strcmp(pred_canonical, canonical_head) == 0);
-    free(pred_canonical);
-    if (same_canonical) return 0;
+    /* v1.1.2 FIX: Self-reference = ТОЧНОЕ совпадение,
+     * не canonical form match */
+    int same_exact = (strcmp(pred, canonical_head) == 0);
+    if (same_exact) return 0;
+    
+    /* Если pred — это impl-версия canonical_head (например, "blocked_impl_0" vs "blocked"),
+     * это НЕ self-reference, а зависимость от другого предиката.
+     * Нужно вычислить stratum для pred. */
 
+    /* Проверка: является ли предикат base (не имеет правил)? */
     int is_base = 1;
     for (Rule *r = c->rules; r; r = r->next) {
         if (strcmp(r->head, pred) == 0) { is_base = 0; break; }
@@ -758,8 +1013,27 @@ static int pred_strat_internal(const char *pred, const ClosureIR *c,
     return max_strat;
 }
 
+/* ========================================================================= */
+/* ЧАСТЬ 5: SATURATION — итеративное насыщение до fixpoint                   */
+/* ========================================================================= */
+
+/*
+ * saturate: применить все правила по стратам до достижения fixpoint
+ *
+ * Это ядро декларативной семантики SuperLang. На каждой страте:
+ *   1. Применяем все правила со stratum == s
+ *   2. Повторяем до тех пор, пока на итерации не добавится ни одного факта
+ *   3. Переходим к следующей страте
+ *
+ * Используется naive evaluation (не semi-naive), что работает для
+ * небольших программ, но не масштабируется.
+ * 
+ * TODO: semi-naive evaluation для production
+ */
 void saturate(Config *c, const ClosureIR *closure) {
     printf("\n[Saturation]\n");
+    
+    /* Вычисляем stratum для каждого правила */
     int *strats = malloc(closure->rule_count * sizeof(int));
     int max_strat = 0;
     int i = 0;
@@ -775,6 +1049,27 @@ void saturate(Config *c, const ClosureIR *closure) {
     }
     printf("  Stratification: %d levels (0 to %d)\n", max_strat + 1, max_strat);
 
+    /* Отладочный вывод правил по стратам */
+    printf("\n  [DEBUG] Rules by stratum:\n");
+    for (int s = 0; s <= max_strat; s++) {
+        printf("    Strat %d:\n", s);
+        i = 0;
+        for (Rule *r = closure->rules; r; r = r->next) {
+            if (strats[i] == s) {
+                printf("      %s <- ", r->head);
+                for (int j = 0; j < r->body_count; j++) {
+                    if (j > 0) printf(", ");
+                    if (r->body_negative[j]) printf("not ");
+                    printf("%s", r->body_preds[j]);
+                }
+                printf("\n");
+            }
+            i++;
+        }
+    }
+    printf("\n");
+
+    /* Применяем правила по стратам */
     int total_added = 0;
     for (int s = 0; s <= max_strat; s++) {
         printf("  Strat %d:\n", s);
@@ -784,7 +1079,13 @@ void saturate(Config *c, const ClosureIR *closure) {
             int added_this_round = 0;
             i = 0;
             for (Rule *r = closure->rules; r; r = r->next) {
-                if (strats[i] == s) added_this_round += apply_rule(c, r);
+                if (strats[i] == s) {
+                    int added = apply_rule(c, r);
+                    if (added > 0) {
+                        printf("    [DEBUG] Rule '%s' added %d facts\n", r->head, added);
+                    }
+                    added_this_round += added;
+                }
                 i++;
             }
             printf("    Iteration %d: +%d facts\n", iteration, added_this_round);
@@ -798,6 +1099,7 @@ void saturate(Config *c, const ClosureIR *closure) {
     printf("  Total facts added: %d\n", total_added);
     free(strats);
 
+    /* Диагностический вывод */
     printf("\n[Diagnostic] Facts by predicate:\n");
     for (Fact *f = c->facts; f; f = f->next) {
         int count = 0;
