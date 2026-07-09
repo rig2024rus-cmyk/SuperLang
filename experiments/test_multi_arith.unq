@@ -1,0 +1,17 @@
+# Test: Multiple arithmetic assignments in one rule (v1.2)
+# Simulates simple physics: position, velocity, time
+
+relation state(x, v, t)
+
+input {
+    state(0, 10, 0)
+}
+
+derive state(new_x, new_v, new_t) from
+    state(x, v, t),
+    new_x = x + v,
+    new_v = v - 1,
+    new_t = t + 1,
+    t < 5
+
+query state(!X, !V, !T)
