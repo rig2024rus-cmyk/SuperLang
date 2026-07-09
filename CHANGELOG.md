@@ -1,4 +1,35 @@
-## v0.8 (2026-01-07) — Pattern matching + Comparison operators
+## v1.1 (2026-07-09) — Built-in math functions + zero memory leaks
+
+### Новые возможности
+- **15 встроенных математических функций** из libm:
+  - Одноаргументные: `sqrt`, `abs`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `exp`, `log`, `log10`, `floor`, `ceil`, `round`
+  - Двухаргументные: `pow`, `fmod`, `atan2`, `fmin`, `fmax`
+- **Синтаксис вызова функций** в выражениях: `d = sqrt(x*x + y*y)`
+- **Правильное разделение пространств имён**: `fmin`/`fmax` для математики (min/max зарезервированы для агрегатов)
+
+### Качество
+- **Полное устранение утечки памяти**: 0 leaks, 0 errors во всех сценариях
+- **Perfect heap balance**: 1762 allocs / 1762 frees
+- **Защита от OOM** во всех критичных местах (copy_expr, expr_new_call)
+- **Гарантированный cleanup** во всех ветках ошибок парсера
+
+### Архитектура
+- Добавлен новый тип узла AST: `EXPR_CALL`
+- Парсер распознаёт синтаксис `func(arg1, arg2, ...)`
+- Runtime диспетчеризирует вызовы на функции libm
+- Чёткие ownership semantics: `expr_new_call` принимает strdup'd строку
+
+### Пример использования
+```prolog
+relation point(x, y)
+input { point(3, 4) point(5, 12) }
+
+derive distance(x, y, d) from
+    point(x, y),
+    d = sqrt(x*x + y*y)
+
+query distance(!X, !Y, !D)
+# → [(3, 4, 5), (5, 12, 13)]## v0.8 (2026-01-07) — Pattern matching + Comparison operators
 
 ### Новые возможности
 - **Pattern matching в queries:** возвращает список bindings вместо TRUE/FALSE

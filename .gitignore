@@ -1,16 +1,26 @@
 # Build artifacts
 *.o
 superlang
+superlang.exe
 
 # Editor files
 .vscode/
 .idea/
 *.swp
+*.swo
 *~
 .DS_Store
+Thumbs.db
 
 # Temporary files
 *.tmp
 *.bak
 *.tar.gz
 backup_*/
+core
+core.*
+
+# Credentials (НИКОГДА не коммитить токены)
+.git-credentials
+*.token
+gh_token.txt
