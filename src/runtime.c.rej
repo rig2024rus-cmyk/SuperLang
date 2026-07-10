@@ -1,0 +1,273 @@
+diff a/src/runtime.c b/src/runtime.c	(rejected hunks)
+@@ -1,5 +1,6 @@
+ #include "runtime.h"
+ #include "synthesizer.h"
++#include "limits_superlang.h"
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdio.h>
+@@ -90,7 +91,11 @@ static int fact_exists(Config *c, const char *pred, int arity, char **args) {
+     return 0;
+ }
+ 
+-static void add_fact_direct(Config *c, const char *pred, int arity, char **args) {
++/* Not static: exposed via runtime.h as config_add_fact_arr() so callers
++ * that already have an arg array (e.g. main.c loading input facts) aren't
++ * forced through config_add_fact()'s varargs interface, which is why input
++ * loading previously only handled arity 1-3 and silently dropped the rest. */
++void add_fact_direct(Config *c, const char *pred, int arity, char **args) {
+     if (fact_exists(c, pred, arity, args)) return;
+     Fact *f = calloc(1, sizeof(Fact));
+     f->predicate = strdup(pred);
+@@ -314,7 +319,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
+         for (int j = 0; j < g->key_count; j++) args[ai++] = g->key[j];
+ 
+         char buf[64];
+-        if (result == (int)result && fabs(result) < 1e15)
++        if (fabs(result) < 1e15 && result == (int)result)
+             snprintf(buf, sizeof(buf), "%d", (int)result);
+         else
+             snprintf(buf, sizeof(buf), "%.2f", result);
+@@ -340,15 +345,15 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
+ 
+ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+     int added = 0;
+-    int regular_slots[16], regular_count = 0;
+-    for (int i = 0; i < r->body_count && regular_count < 16; i++) {
++    int regular_slots[SUPERLANG_MAX_BODY_ATOMS], regular_count = 0;
++    for (int i = 0; i < r->body_count && regular_count < SUPERLANG_MAX_BODY_ATOMS; i++) {
+         if (strcmp(r->body_preds[i], "__arith__") != 0)
+             regular_slots[regular_count++] = i;
+     }
+     if (regular_count == 0) return added;
+ 
+-    Fact **fact_lists[16];
+-    int fact_counts[16];
++    Fact **fact_lists[SUPERLANG_MAX_BODY_ATOMS];
++    int fact_counts[SUPERLANG_MAX_BODY_ATOMS];
+     for (int s = 0; s < regular_count; s++) {
+         int slot = regular_slots[s];
+         fact_lists[s] = NULL;
+@@ -365,18 +370,18 @@ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+         }
+     }
+ 
+-    int atom_to_pos[32];
+-    for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
++    int atom_to_pos[SUPERLANG_MAX_BODY_ATOMS];
++    for (int i = 0; i < SUPERLANG_MAX_BODY_ATOMS; i++) atom_to_pos[i] = -1;
+     for (int s = 0; s < regular_count; s++) atom_to_pos[regular_slots[s]] = s;
+ 
+-    int indices[16] = {0};
++    int indices[SUPERLANG_MAX_BODY_ATOMS] = {0};
+     while (1) {
+         int valid = 1;
+         for (int s = 0; s < regular_count; s++)
+             if (indices[s] >= fact_counts[s]) { valid = 0; break; }
+         if (!valid) break;
+ 
+-        Fact *current_facts[16];
++        Fact *current_facts[SUPERLANG_MAX_BODY_ATOMS];
+         for (int s = 0; s < regular_count; s++)
+             current_facts[s] = fact_lists[s][indices[s]];
+ 
+@@ -387,14 +392,34 @@ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+         for (int b = 0; b < r->arg_binding_count && combination_valid; b++) {
+             ArgBinding *bind = &r->arg_bindings[b];
+             if (bind->location_count == 0) { binding_values[b] = NULL; continue; }
+-            ArgLocation *first = &bind->locations[0];
+-            int pos = atom_to_pos[first->atom_index];
+-            if (pos < 0) { combination_valid = 0; break; }
+-            char *value = current_facts[pos]->args[first->arg_index];
++            /* Find the first occurrence that sits in a POSITIVE atom (order-
++             * independent: don't assume locations[0] is positive, even though
++             * ast_to_graph.c currently emits positive atoms before negative
++             * ones). Occurrences inside negative atoms are validated later,
++             * in the negation-check block below, via fact_exists() — they
++             * must never be treated as an unbound/invalid combination here. */
++            int first_pos_loc = -1;
++            for (int l = 0; l < bind->location_count; l++) {
++                if (atom_to_pos[bind->locations[l].atom_index] >= 0) {
++                    first_pos_loc = l;
++                    break;
++                }
++            }
++            if (first_pos_loc < 0) {
++                /* Variable never occurs in a positive atom. type_checker.c's
++                 * safety pass rejects such rules at compile time, so this is
++                 * a defensive fallback for an invariant violation elsewhere,
++                 * not an expected runtime path. */
++                combination_valid = 0;
++                break;
++            }
++            int pos = atom_to_pos[bind->locations[first_pos_loc].atom_index];
++            char *value = current_facts[pos]->args[bind->locations[first_pos_loc].arg_index];
+             binding_values[b] = value;
+-            for (int l = 1; l < bind->location_count; l++) {
++            for (int l = 0; l < bind->location_count; l++) {
++                if (l == first_pos_loc) continue;
+                 int p = atom_to_pos[bind->locations[l].atom_index];
+-                if (p < 0) { combination_valid = 0; break; }
++                if (p < 0) continue; /* negative-atom occurrence; checked later */
+                 if (strcmp(value, current_facts[p]->args[bind->locations[l].arg_index]) != 0) {
+                     combination_valid = 0; break;
+                 }
+@@ -424,7 +449,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+ 
+             if (combination_valid) {
+                 /* ИЗМЕНЕНИЕ v1.2: Вычисление ВСЕЙ арифметики */
+-                double arith_vals[16] = {0};
++                double arith_vals[SUPERLANG_MAX_BODY_ATOMS] = {0};
+                 for (int i = 0; i < r->body_count; i++) {
+                     if (r->arith_exprs[i]) {
+                         arith_vals[i] = eval_expr(r->arith_exprs[i], &vbinds);
+@@ -459,7 +484,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+                         if (arith_slot >= 0) {
+                             char buf[64];
+                             double val = arith_vals[arith_slot];
+-                            if (val == (int)val && fabs(val) < 1e15)
++                            if (fabs(val) < 1e15 && val == (int)val)
+                                 snprintf(buf, sizeof(buf), "%d", (int)val);
+                             else
+                                 snprintf(buf, sizeof(buf), "%.2f", val);
+@@ -508,7 +533,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+ static int apply_rule_general(Config *c, const Rule *r) {
+     if (r->body_count == 0) return 0;
+ 
+-    int pos_indices[32], neg_indices[32];
++    int pos_indices[SUPERLANG_MAX_BODY_ATOMS], neg_indices[SUPERLANG_MAX_BODY_ATOMS];
+     int pos_count = 0, neg_count = 0;
+     for (int i = 0; i < r->body_count; i++) {
+         if (r->body_negative[i]) neg_indices[neg_count++] = i;
+@@ -517,8 +542,8 @@ static int apply_rule_general(Config *c, const Rule *r) {
+ 
+     if (pos_count == 0) return 0;
+ 
+-    Fact **fact_lists[32];
+-    int fact_counts[32];
++    Fact **fact_lists[SUPERLANG_MAX_BODY_ATOMS];
++    int fact_counts[SUPERLANG_MAX_BODY_ATOMS];
+     for (int p = 0; p < pos_count; p++) {
+         int slot = pos_indices[p];
+         fact_lists[p] = NULL;
+@@ -535,11 +560,11 @@ static int apply_rule_general(Config *c, const Rule *r) {
+         }
+     }
+ 
+-    int atom_to_pos[32];
+-    for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
++    int atom_to_pos[SUPERLANG_MAX_BODY_ATOMS];
++    for (int i = 0; i < SUPERLANG_MAX_BODY_ATOMS; i++) atom_to_pos[i] = -1;
+     for (int p = 0; p < pos_count; p++) atom_to_pos[pos_indices[p]] = p;
+ 
+-    int indices[32] = {0};
++    int indices[SUPERLANG_MAX_BODY_ATOMS] = {0};
+     int added = 0;
+ 
+     while (1) {
+@@ -548,7 +573,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
+             if (indices[p] >= fact_counts[p]) { valid = 0; break; }
+         if (!valid) break;
+ 
+-        Fact *current_facts[32];
++        Fact *current_facts[SUPERLANG_MAX_BODY_ATOMS];
+         for (int p = 0; p < pos_count; p++)
+             current_facts[p] = fact_lists[p][indices[p]];
+ 
+@@ -559,14 +584,34 @@ static int apply_rule_general(Config *c, const Rule *r) {
+         for (int b = 0; b < r->arg_binding_count && combination_valid; b++) {
+             ArgBinding *bind = &r->arg_bindings[b];
+             if (bind->location_count == 0) { binding_values[b] = NULL; continue; }
+-            ArgLocation *first = &bind->locations[0];
+-            int pos = atom_to_pos[first->atom_index];
+-            if (pos < 0) { combination_valid = 0; break; }
+-            char *value = current_facts[pos]->args[first->arg_index];
++            /* Find the first occurrence that sits in a POSITIVE atom (order-
++             * independent: don't assume locations[0] is positive, even though
++             * ast_to_graph.c currently emits positive atoms before negative
++             * ones). Occurrences inside negative atoms are validated later,
++             * in the negation-check block below, via fact_exists() — they
++             * must never be treated as an unbound/invalid combination here. */
++            int first_pos_loc = -1;
++            for (int l = 0; l < bind->location_count; l++) {
++                if (atom_to_pos[bind->locations[l].atom_index] >= 0) {
++                    first_pos_loc = l;
++                    break;
++                }
++            }
++            if (first_pos_loc < 0) {
++                /* Variable never occurs in a positive atom. type_checker.c's
++                 * safety pass rejects such rules at compile time, so this is
++                 * a defensive fallback for an invariant violation elsewhere,
++                 * not an expected runtime path. */
++                combination_valid = 0;
++                break;
++            }
++            int pos = atom_to_pos[bind->locations[first_pos_loc].atom_index];
++            char *value = current_facts[pos]->args[bind->locations[first_pos_loc].arg_index];
+             binding_values[b] = value;
+-            for (int l = 1; l < bind->location_count; l++) {
++            for (int l = 0; l < bind->location_count; l++) {
++                if (l == first_pos_loc) continue;
+                 int p = atom_to_pos[bind->locations[l].atom_index];
+-                if (p < 0) { combination_valid = 0; break; }
++                if (p < 0) continue; /* negative-atom occurrence; checked later */
+                 if (strcmp(value, current_facts[p]->args[bind->locations[l].arg_index]) != 0) {
+                     combination_valid = 0; break;
+                 }
+@@ -579,7 +624,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
+                 const char *neg_pred = r->body_preds[slot];
+                 int neg_arity = r->body_arities[slot];
+                 
+-                char *neg_args[32];
++                char *neg_args[SUPERLANG_MAX_ARITY];
+                 for (int a = 0; a < neg_arity; a++) neg_args[a] = NULL;
+                 
+                 for (int b = 0; b < r->arg_binding_count; b++) {
+@@ -663,17 +708,35 @@ static int apply_rule(Config *c, const Rule *r) {
+ 
+ void saturate(Config *c, const ClosureIR *closure) {
+     if (!c || !closure) return;
+-    
+-    int changed = 1;
+-    int max_iterations = 100;
+-    int iteration = 0;
+-    
+-    while (changed && iteration < max_iterations) {
+-        changed = 0;
+-        for (Rule *r = closure->rules; r; r = r->next) {
+-            int added = apply_rule(c, r);
+-            if (added > 0) changed = 1;
++
++    /* Rules must be applied in non-decreasing stratum order, running each
++     * stratum to its own fixpoint before advancing — that is the entire
++     * point of stratification: a negated predicate must be fully computed
++     * before any rule that negates it runs, or a rule can permanently commit
++     * a fact based on an incomplete view of what it negates (this engine
++     * has no retraction, so such a fact can never later be corrected).
++     * r->stratum is precomputed by graph_compute_strata() from the same SCC
++     * condensation that graph_validate_semantics() uses to reject
++     * non-stratifiable programs, so this loop can trust it directly instead
++     * of re-deriving stratum order here. */
++    int max_stratum = 0;
++    for (Rule *r = closure->rules; r; r = r->next) {
++        if (r->stratum > max_stratum) max_stratum = r->stratum;
++    }
++
++    int max_iterations = 10000; /* fixpoint safety cap per stratum */
++
++    for (int s = 0; s <= max_stratum; s++) {
++        int changed = 1;
++        int iteration = 0;
++        while (changed && iteration < max_iterations) {
++            changed = 0;
++            for (Rule *r = closure->rules; r; r = r->next) {
++                if (r->stratum != s) continue;
++                int added = apply_rule(c, r);
++                if (added > 0) changed = 1;
++            }
++            iteration++;
+         }
+-        iteration++;
+     }
+ }

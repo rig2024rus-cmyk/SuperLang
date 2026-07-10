@@ -1,0 +1,135 @@
+diff a/src/semantic_validator.c b/src/semantic_validator.c	(rejected hunks)
+@@ -60,24 +60,26 @@ static void tarjan_state_free(TarjanState *state) {
+     free(state);
+ }
+ 
+-/* Build array of node pointers from linked list for indexed access.
++/* Build array of node pointers from linked list for indexed access, and
++ * stamp each Node with its array index (temp_idx) so lookups are O(1)
++ * instead of an O(node_count) scan per edge — that scan previously made
++ * the whole SCC pass O(V*E) rather than Tarjan's proper O(V+E).
+  * Caller must free the returned array (but not the Nodes it points to). */
+ static Node **build_nodes_array(const Graph *g) {
+     Node **arr = malloc(g->node_count * sizeof(Node*));
+     if (!arr) return NULL;
+     size_t i = 0;
+     for (Node *n = g->nodes; n && i < g->node_count; n = n->next) {
++        n->temp_idx = (int)i;
+         arr[i++] = n;
+     }
+     return arr;
+ }
+ 
+-/* Find index of target node in array. Returns -1 if not found. */
++/* O(1): the index was stamped onto the node itself by build_nodes_array(). */
+ static int find_node_index(Node **nodes_arr, size_t node_count, const Node *target) {
+-    for (size_t i = 0; i < node_count; i++) {
+-        if (nodes_arr[i] == target) return (int)i;
+-    }
+-    return -1;
++    (void)nodes_arr; (void)node_count;
++    return target->temp_idx;
+ }
+ 
+ static void tarjan_strongconnect(Node **nodes_arr, size_t node_count,
+@@ -90,11 +92,20 @@ static void tarjan_strongconnect(Node **nodes_arr, size_t node_count,
+ 
+     Node *node = nodes_arr[v];
+     for (Edge *e = node->outgoing; e; e = e->next) {
+-        /* Only dependency edges form the SCC graph */
++        /* Only dependency edges form the SCC graph. EDGE_DEFINED_BY_AGGREGATE
++         * is included: it is a genuine cross-predicate dependency (the
++         * aggregate's source predicate), and excluding it previously let a
++         * negative cycle routed through an aggregate go undetected as
++         * "stratifiable" when it wasn't. FILTER/ARITHMETIC edges are real
++         * self-loops by construction (ast_to_graph.c always sets their
++         * target to the same node they originate from) and stay excluded,
++         * since including them would just add meaningless self-loops for
++         * every rule that happens to use a comparison or arithmetic. */
+         if (e->type != EDGE_DEFINED_BY_COMPOSITION &&
+             e->type != EDGE_DEFINED_BY_RECURSIVE &&
+             e->type != EDGE_DEFINED_BY_NEGATION &&
+-            e->type != EDGE_DEFINED_BY_BASE) {
++            e->type != EDGE_DEFINED_BY_BASE &&
++            e->type != EDGE_DEFINED_BY_AGGREGATE) {
+             continue;
+         }
+ 
+@@ -293,8 +304,76 @@ ValidationResult graph_validate_semantics(const Graph *g) {
+ }
+ 
+ /* ====================================================================== */
+-/* Result helpers                                                          */
++/* Stratum assignment                                                      */
+ /* ====================================================================== */
++/*
++ * Assigns one stratum number to every node, derived from the SAME SCC
++ * condensation used above to reject non-stratifiable programs — rather
++ * than a second, independent per-rule heuristic (the previous approach,
++ * which could assign a copy-rule a lower stratum than the impl rule it
++ * copies from, whenever negation pushed the impl rule above stratum 0).
++ *
++ * Tarjan's algorithm emits SCCs in reverse topological order of the
++ * condensation DAG: if SCC A has an edge to a *different* SCC B (A
++ * depends on B), B is always emitted before A. Processing state->sccs
++ * in emission order (0, 1, 2, ...) therefore guarantees that by the time
++ * SCC i is processed, every other SCC it points to already has a final
++ * stratum. Edges back into the same SCC are skipped when computing the
++ * requirement (mutual/self recursion shares one stratum, and
++ * graph_validate_semantics already guarantees no such edge is a negation,
++ * or the program would have been rejected before this ever runs).
++ */
++void graph_compute_strata(Graph *g) {
++    if (!g || g->node_count == 0) return;
++
++    Node **nodes_arr = build_nodes_array(g);
++    if (!nodes_arr) return;
++
++    TarjanState *state = tarjan_find_sccs(g, nodes_arr);
++    if (!state) { free(nodes_arr); return; }
++
++    int *node_to_scc = malloc(g->node_count * sizeof(int));
++    int *scc_stratum = calloc((size_t)state->scc_count, sizeof(int));
++    for (int i = 0; i < state->scc_count; i++) {
++        for (int j = 0; j < state->scc_sizes[i]; j++) {
++            node_to_scc[state->sccs[i][j]] = i;
++        }
++    }
++
++    for (int i = 0; i < state->scc_count; i++) {
++        int max_required = 0;
++        for (int j = 0; j < state->scc_sizes[i]; j++) {
++            Node *node = nodes_arr[state->sccs[i][j]];
++            for (Edge *e = node->outgoing; e; e = e->next) {
++                if (e->type != EDGE_DEFINED_BY_COMPOSITION &&
++                    e->type != EDGE_DEFINED_BY_RECURSIVE &&
++                    e->type != EDGE_DEFINED_BY_NEGATION &&
++                    e->type != EDGE_DEFINED_BY_BASE &&
++                    e->type != EDGE_DEFINED_BY_AGGREGATE) {
++                    continue;
++                }
++                int target_scc = node_to_scc[e->target->temp_idx];
++                if (target_scc == i) continue; /* internal edge, no bump */
++                int required = scc_stratum[target_scc] +
++                                (e->type == EDGE_DEFINED_BY_NEGATION ? 1 : 0);
++                if (required > max_required) max_required = required;
++            }
++        }
++        scc_stratum[i] = max_required;
++    }
++
++    for (int i = 0; i < state->scc_count; i++) {
++        for (int j = 0; j < state->scc_sizes[i]; j++) {
++            nodes_arr[state->sccs[i][j]]->stratum = scc_stratum[i];
++        }
++    }
++
++    free(node_to_scc);
++    free(scc_stratum);
++    tarjan_state_free(state);
++    free(nodes_arr);
++}
++
+ 
+ void validation_result_free(ValidationResult *r) {
+     if (!r) return;

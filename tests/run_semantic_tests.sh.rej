@@ -1,0 +1,186 @@
+diff a/tests/run_semantic_tests.sh b/tests/run_semantic_tests.sh	(rejected hunks)
+@@ -1,4 +1,13 @@
+ #!/bin/bash
++# SuperLang semantic regression suite.
++#
++# Unlike the previous version of this script, this one does not stop at
++# checking the exit code. A program can exit 0 while every single query
++# result printed is wrong (this actually happened: test3/test4 "passed"
++# for months while printing FALSE for answers that should have been TRUE).
++# Each test below also asserts that specific, exact strings appear in the
++# output — the query results the test is named for, verified by hand
++# against the input facts, not just eyeballed.
+ 
+ echo "======================================"
+ echo "SuperLang Semantic Test Suite"
+@@ -8,64 +17,140 @@ echo ""
+ PASS=0
+ FAIL=0
+ 
++# run_test <file> <description> <expected_exit> <expected_string_1> [expected_string_2] ...
++# Every expected_string_N must appear verbatim (as a literal substring) in
++# the combined stdout+stderr output, or the test fails — regardless of
++# exit code.
+ run_test() {
+     local file=$1
+     local description=$2
+     local expected_exit=$3
+-    
++    shift 3
++    local expected_strings=("$@")
++
+     echo "Testing: $description"
+     echo "File: $file"
+-    
++
+     output=$(./superlang "$file" 2>&1)
+     exit_code=$?
+-    
++
++    local ok=1
++
+     if [ $exit_code -ne $expected_exit ]; then
+         echo "✗ FAIL: Exit code $exit_code (expected $expected_exit)"
+-        FAIL=$((FAIL + 1))
+-        return 1
++        ok=0
++    else
++        echo "✓ Exit code correct ($exit_code)"
+     fi
+-    
+-    echo "✓ Exit code correct ($exit_code)"
+-    
+-    # Выводим результат для ручной проверки
++
++    for expected in "${expected_strings[@]}"; do
++        if [[ "$output" == *"$expected"* ]]; then
++            echo "✓ Found: $expected"
++        else
++            echo "✗ FAIL: Expected output not found: $expected"
++            ok=0
++        fi
++    done
++
+     echo "--- Output ---"
+-    echo "$output" | grep -A 20 "QUERY RESULTS" || echo "$output"
++    echo "$output" | grep -A 30 "QUERY RESULTS\|FAILED" || echo "$output"
+     echo "--------------"
+     echo ""
+-    
+-    PASS=$((PASS + 1))
+-    return 0
++
++    if [ $ok -eq 1 ]; then
++        PASS=$((PASS + 1))
++    else
++        FAIL=$((FAIL + 1))
++    fi
+ }
+ 
+-# Test 1: Ancestor (рекурсия)
+-run_test "tests/test1_ancestor.unq" "Recursive ancestor relationship" 0
++# Test 1: Ancestor (recursion, no negation — every stratum lands at 0)
++run_test "tests/test1_ancestor.unq" "Recursive ancestor relationship" 0 \
++    "ancestor(Alice, Bob)
++       → TRUE" \
++    "ancestor(Alice, David)
++       → TRUE" \
++    "ancestor(David, Alice)
++       → FALSE"
+ 
+-# Test 2: Connected components
+-run_test "tests/test2_connected.unq" "Transitive closure (connected)" 0
++# Test 2: Connected components (recursion via multiple derive clauses / union)
++run_test "tests/test2_connected.unq" "Transitive closure (connected)" 0 \
++    "connected(A, B)
++       → TRUE" \
++    "connected(A, D)
++       → FALSE" \
++    "connected(D, E)
++       → TRUE"
+ 
+-# Test 3: Depends (negation)
+-run_test "tests/test3_depends.unq" "Stratified negation (depends/blocked)" 0
++# Test 3: Depends/blocked (stratified negation, pattern-match query)
++# T3 depends on T2 (not finished) -> T3 is the only blocked task.
++run_test "tests/test3_depends.unq" "Stratified negation (depends/blocked)" 0 \
++    "blocked(!ID)
++       → [T3]"
+ 
+-# Test 4: Ready (negation + task scheduling)
+-run_test "tests/test4_ready.unq" "Task readiness with negation" 0
++# Test 4: Ready (negation chained through another negated predicate)
++# This is the exact case that silently returned FALSE/FALSE/FALSE across
++# v1.0-v1.2: the copy-rule/impl-rule stratum mismatch, then the flat
++# unordered fixpoint, then the unification regression.
++run_test "tests/test4_ready.unq" "Task readiness with negation" 0 \
++    "ready(TaskA)
++       → TRUE" \
++    "ready(TaskB)
++       → TRUE" \
++    "ready(TaskC)
++       → FALSE"
+ 
+-# Test 5: Total price (aggregates)
+-run_test "tests/test5_total_price.unq" "Aggregate sum with grouping" 0
++# Test 5: Total price (aggregate sum with grouping)
++run_test "tests/test5_total_price.unq" "Aggregate sum with grouping" 0 \
++    "total_price(Order1, 150)
++       → TRUE" \
++    "total_price(Order2, 200)
++       → TRUE"
+ 
+ # Test 6: Negative cycle (should be rejected)
+-run_test "tests/test6_negative_cycle.unq" "Reject negative cycle" 1
++run_test "tests/test6_negative_cycle.unq" "Reject negative cycle" 1 \
++    "not stratifiable"
+ 
+ # Test 7: Self negation (should be rejected)
+-run_test "tests/test7_self_negation.unq" "Reject self-negation" 1
++run_test "tests/test7_self_negation.unq" "Reject self-negation" 1 \
++    "not stratifiable"
+ 
+ # Test 8: Arithmetic
+-run_test "tests/test8_arith.unq" "Arithmetic expressions" 0
++run_test "tests/test8_arith.unq" "Arithmetic expressions" 0 \
++    "final_price(Widget, 100)
++       → TRUE" \
++    "final_price(Gadget, 200)
++       → TRUE"
+ 
+-# Test 9: Typo (should be rejected)
+-run_test "tests/test9_typo.unq" "Reject undefined predicate" 1
++# Test 9: Typo (should be rejected, with all specific diagnostics present)
++run_test "tests/test9_typo.unq" "Reject undefined predicate / unsafe rules" 1 \
++    "Unknown predicate 'blockd'" \
++    "Safety violation: variable 'other' used in negated atom 'Finished'" \
++    "Safety violation: head variable 't' of derive 'broken_rule' not bound in body" \
++    "Arity mismatch for 'Task'"
+ 
+-# Test 10: Built-in math functions
+-run_test "experiments/test_builtin.unq" "Built-in math (sqrt, pow, etc.)" 0
++# Test 10: Negative recursion through an aggregate edge (should be rejected)
++run_test "tests/test10_aggregate_cycle.unq" "Reject negative cycle through an aggregate" 1 \
++    "not stratifiable"
++
++# Test 11: Deep negation chain (4 levels -> 4 strata, must alternate)
++run_test "tests/test11_deep_negation_chain.unq" "Deep negation chain (4 strata)" 0 \
++    "a(k1)
++       → TRUE" \
++    "b(k1)
++       → FALSE" \
++    "c(k1)
++       → TRUE" \
++    "d(k1)
++       → FALSE"
++
++# Test 12: Built-in math functions
++if [ -f "experiments/test_builtin.unq" ]; then
++    run_test "experiments/test_builtin.unq" "Built-in math (sqrt, pow, etc.)" 0 \
++        "distance(!X, !Y, !D)" \
++        "(5, 12, 13)" \
++        "(0, 10, 10)"
++fi
+ 
+ echo "======================================"
+ echo "Summary: $PASS passed, $FAIL failed"
