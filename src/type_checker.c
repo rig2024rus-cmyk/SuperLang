@@ -1,4 +1,5 @@
 #include "type_checker.h"
+#include "limits_superlang.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -200,6 +201,29 @@ static void collect_expr_vars(const Expr *e, VarSet *vars) {
 
 static void check_condition(const Condition *cond, const PredTable *preds,
                             VarSet *bound_vars, TypeCheckResult *result) {
+    /* Pass 0: reject rules that runtime.c's fixed-size stack buffers
+     * (atom_to_pos[], neg_args[], etc. — sized from these same constants)
+     * cannot hold. Catching this here, at compile time, turns what would
+     * otherwise be a silent stack buffer overflow (too many body atoms) or
+     * silent truncation (too many arguments) into a clear error. */
+    int total_slots = cond->atom_count + cond->arith_count;
+    if (total_slots > SUPERLANG_MAX_BODY_ATOMS) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "Rule body has %d atoms/arithmetic-assignments; maximum supported is %d",
+                 total_slots, SUPERLANG_MAX_BODY_ATOMS);
+        result_add(result, msg, cond->loc.line, cond->loc.column, NULL);
+    }
+    for (int i = 0; i < cond->atom_count; i++) {
+        if (cond->atoms[i].arg_count > SUPERLANG_MAX_ARITY) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "Predicate '%s' used with %d arguments; maximum supported is %d",
+                     cond->atoms[i].predicate, cond->atoms[i].arg_count, SUPERLANG_MAX_ARITY);
+            result_add(result, msg, cond->atoms[i].loc.line, cond->atoms[i].loc.column, NULL);
+        }
+    }
+
     /* Pass 1: bind variables from positive atoms */
     for (int i = 0; i < cond->atom_count; i++) {
         const Atom *a = &cond->atoms[i];

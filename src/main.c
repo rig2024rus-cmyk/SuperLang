@@ -318,6 +318,11 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     
+    /* Stage 4.5: Assign evaluation strata now that we know the graph is
+     * stratifiable — reuses the SCC condensation graph_validate_semantics
+     * already computed rather than a second, independent notion of stratum. */
+    graph_compute_strata(trans.graph);
+    
     /* Stage 5: Synthesize Closure IR */
     if (cfg.verbose) printf("[5] Synthesizing closure operator...\n");
     closure = synthesize(trans.graph);
@@ -335,16 +340,7 @@ int main(int argc, char **argv) {
     config = config_new();
     for (int i = 0; i < parse.program->input_count; i++) {
         const InputFact *f = &parse.program->inputs[i];
-        switch (f->arg_count) {
-            case 1: config_add_fact(config, f->predicate, 1, f->args[0]); break;
-            case 2: config_add_fact(config, f->predicate, 2, f->args[0], f->args[1]); break;
-            case 3: config_add_fact(config, f->predicate, 3, f->args[0], f->args[1], f->args[2]); break;
-            default:
-                if (cfg.verbose) {
-                    printf("    (skipping fact with %d args — not supported)\n", f->arg_count);
-                }
-                break;
-        }
+        add_fact_direct(config, f->predicate, f->arg_count, f->args);
     }
     if (cfg.verbose) {
         printf("    ✓ Loaded\n");

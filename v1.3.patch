@@ -1,0 +1,1093 @@
+From 67964bd165342b01e14f23e8f811bf1bbeb20e41 Mon Sep 17 00:00:00 2001
+From: "Claude (via BandSea's request)" <claude@anthropic.local>
+Date: Fri, 10 Jul 2026 08:18:30 +0000
+Subject: [PATCH] fix: correct stratification, unification regression,
+ aggregate-cycle detection
+
+- Restore correct stratified evaluation by computing one stratum per SCC
+  of the true dependency graph (graph_compute_strata, reusing the existing
+  Tarjan pass in semantic_validator.c), replacing both the old per-rule
+  self-reference heuristic (which could give a copy-rule P :- P_impl_N a
+  lower stratum than P_impl_N itself) and v1.2's flat unordered fixpoint
+  (unsound for negation: this engine has no fact retraction, so a rule
+  can permanently commit a fact based on an incomplete view of what it
+  negates, depending on rule list order).
+
+- Fix a unification regression in apply_rule_general/apply_rule_arithmetic:
+  a variable occurring in both a positive and a negative atom (the normal
+  shape of stratified negation) was unconditionally rejected instead of
+  having its negative-atom occurrences deferred to the negation-check
+  block. Made the positive-occurrence lookup order-independent instead of
+  assuming locations[0] is positive.
+
+- Add EDGE_DEFINED_BY_AGGREGATE to the SCC dependency graph in
+  semantic_validator.c: a negative cycle closed through an aggregate
+  dependency was previously invisible to Tarjan and silently accepted as
+  stratifiable.
+
+- Fix O(V*E) Tarjan (find_node_index did an O(V) scan per edge) back down
+  to O(V+E) via an index stamped on each Node.
+
+- Fix float->int UB (result==(int)result evaluated before the magnitude
+  guard) by checking magnitude first.
+
+- Unify the previously-inconsistent fixed buffer sizes (16 vs 32) onto
+  shared SUPERLANG_MAX_BODY_ATOMS/MAX_ARITY constants, and reject in
+  type_checker.c (compile time) any rule that would exceed them, instead
+  of silently truncating or overflowing a stack buffer at runtime.
+
+- Fix config loading silently dropping input facts of arity >= 4 by
+  loading through the existing array-based add_fact_direct instead of
+  config_add_fact's varargs 1/2/3 switch.
+
+- Test infra: run_semantic_tests.sh now asserts actual expected output,
+  not just exit codes (it previously reported PASS on test3/test4 while
+  printing wrong answers). Removed tests/run_tests.sh (referenced the
+  wrong directory and stale filenames; fully superseded by
+  run_semantic_tests.sh + run_valgrind_all.sh). Added test10 (negative
+  cycle through an aggregate) and test11 (4-level negation chain).
+
+Verified: 12/12 semantic tests with real value assertions, 12/12 valgrind
+clean (0 errors, 0 leaks), all existing examples still run, clean -Wall
+-Wextra build.
+---
+ CHANGELOG.md                         |  55 ++++++++++
+ include/graph.h                      |   2 +
+ include/limits_superlang.h           |  14 +++
+ include/runtime.h                    |   5 +
+ include/semantic_validator.h         |   7 ++
+ include/synthesizer.h                |   5 +
+ src/main.c                           |  16 ++-
+ src/runtime.c                        | 149 +++++++++++++++++++--------
+ src/semantic_validator.c             |  97 +++++++++++++++--
+ src/synthesizer.c                    |   4 +
+ src/type_checker.c                   |  24 +++++
+ tests/run_semantic_tests.sh          | 145 ++++++++++++++++++++------
+ tests/run_tests.sh                   |  78 --------------
+ tests/test10_aggregate_cycle.unq     |  32 ++++++
+ tests/test11_deep_negation_chain.unq |  29 ++++++
+ 15 files changed, 492 insertions(+), 170 deletions(-)
+ create mode 100644 include/limits_superlang.h
+ delete mode 100755 tests/run_tests.sh
+ create mode 100644 tests/test10_aggregate_cycle.unq
+ create mode 100644 tests/test11_deep_negation_chain.unq
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fa393d2..73c750f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,58 @@
++## v1.3 (2026-07-10) — Correct stratification, unification fix, aggregate-cycle detection
++
++### Критические исправления
++
++- **Стратификация вычисляется заново, из SCC-конденсации, а не эвристикой.**
++  `graph_compute_strata()` (semantic_validator.c) переиспользует уже
++  существующий Tarjan-проход: один stratum на SCC истинного графа
++  зависимостей, +1 при пересечении negation-ребра между SCC. Заменяет
++  и старую per-rule эвристику через `strip_impl_suffix`/self-reference
++  (которая могла присвоить copy-правилу `P :- P_impl_N` stratum ниже,
++  чем нужно `P_impl_N`, и `P` навсегда оставался пустым), и v1.2-й
++  плоский неупорядоченный фикспоинт (несостоятельный для negation: без
++  retraction фактов порядок правил в списке мог навсегда зафиксировать
++  факт, выведенный по неполной картине того, что негируется).
++
++- **Регрессия в unification исправлена.** В `apply_rule_general` и
++  `apply_rule_arithmetic` переменная, встречающаяся одновременно в
++  positive- и negative-атоме (обычная форма stratified negation),
++  безусловно отклоняла всю комбинацию вместо того, чтобы отложить
++  проверку negative-вхождения до блока проверки негации. Поиск первого
++  positive-вхождения сделан независимым от порядка локаций.
++
++- **Дыра в проверке stratifiability через агрегаты закрыта.**
++  `EDGE_DEFINED_BY_AGGREGATE` добавлено в SCC-граф зависимостей — ранее
++  негативный цикл, замыкающийся через агрегат, был невидим для Tarjan и
++  молча принимался как stratifiable.
++
++### Робастность
++
++- Tarjan исправлен с O(V·E) до O(V+E): `find_node_index` делал линейный
++  проход по узлам на каждое ребро; теперь индекс проштампован на `Node`.
++- Исправлено UB при касте float→int (`result == (int)result` вычислялся
++  до проверки границы `fabs(...) < 1e15`, а не после).
++- Несогласованные размеры фиксированных буферов (16 vs 32) объединены в
++  `SUPERLANG_MAX_BODY_ATOMS`/`SUPERLANG_MAX_ARITY`; правило, превышающее
++  лимит, теперь отклоняется на этапе type-checking с понятной ошибкой,
++  а не переполняет стек или молча обрезается в рантайме.
++- Загрузка входных фактов с arity ≥ 4 больше не отбрасывается молча
++  (`config_add_fact`'s varargs 1/2/3 switch → `add_fact_direct` с массивом).
++
++### Тестовая инфраструктура
++
++- `run_semantic_tests.sh` теперь проверяет фактические значения в выводе,
++  а не только exit code (ранее test3/test4 отчитывались как PASSED,
++  печатая неверные ответы).
++- Удалён `run_tests.sh` (указывал на несуществующие пути/файлы, полностью
++  заменён `run_semantic_tests.sh` + `run_valgrind_all.sh`).
++- Добавлены `test10_aggregate_cycle.unq` (негативный цикл через агрегат
++  должен отклоняться) и `test11_deep_negation_chain.unq` (4-уровневая
++  цепочка negation, должна чередоваться TRUE/FALSE/TRUE/FALSE).
++
++Проверено: 12/12 semantic-тестов с реальными assert'ами на значения,
++12/12 valgrind (0 errors, 0 leaks), все существующие examples/ работают,
++чистая сборка -Wall -Wextra.
++
+ ## v1.1 (2026-07-09) — Built-in math functions + zero memory leaks
+ 
+ ### Новые возможности
+diff --git a/include/graph.h b/include/graph.h
+index 2f5452d..8274a27 100644
+--- a/include/graph.h
++++ b/include/graph.h
+@@ -50,6 +50,8 @@ typedef struct Node {
+     int head_param_count;
+     Edge *outgoing;
+     struct Node *next;
++    int stratum;      /* computed by graph_compute_strata(); valid only after validation passes */
++    int temp_idx;      /* scratch index used by Tarjan's SCC pass; not meaningful outside it */
+ } Node;
+ 
+ typedef struct Graph {
+diff --git a/include/limits_superlang.h b/include/limits_superlang.h
+new file mode 100644
+index 0000000..83f653a
+--- /dev/null
++++ b/include/limits_superlang.h
+@@ -0,0 +1,14 @@
++#ifndef SUPERLANG_LIMITS_H
++#define SUPERLANG_LIMITS_H
++
++/* Runtime.c's rule evaluators use fixed-size stack buffers, sized from
++ * these same constants, for per-atom and per-argument bookkeeping
++ * (atom_to_pos[], pos_indices[], neg_args[], etc). type_checker.c rejects
++ * any rule that would exceed them *before* synthesis, so runtime.c can
++ * safely assume these limits hold rather than needing its own bounds
++ * checks in the hot path. If either limit is raised, raise the matching
++ * array sizes in runtime.c to match. */
++#define SUPERLANG_MAX_BODY_ATOMS 32
++#define SUPERLANG_MAX_ARITY 32
++
++#endif
+diff --git a/include/runtime.h b/include/runtime.h
+index f9705e2..331d92d 100644
+--- a/include/runtime.h
++++ b/include/runtime.h
+@@ -26,6 +26,11 @@ void config_free(Config *c);
+ void config_add_fact(Config *c, const char *pred, int arity, ...);
+ int config_has_fact(Config *c, const char *pred, int arity, ...);
+ 
++/* Array-based fact insertion (any arity, deduplicated) — use this instead
++ * of config_add_fact's varargs form when args are already in an array,
++ * e.g. when loading parsed input facts. */
++void add_fact_direct(Config *c, const char *pred, int arity, char **args);
++
+ /* Saturation */
+ void saturate(Config *c, const ClosureIR *closure);
+ 
+diff --git a/include/semantic_validator.h b/include/semantic_validator.h
+index 27f966d..27c6b72 100644
+--- a/include/semantic_validator.h
++++ b/include/semantic_validator.h
+@@ -15,6 +15,13 @@ ValidationResult graph_validate_structure(const Graph *g);
+ /* Semantic validation: checks stratification, negative cycles, etc. */
+ ValidationResult graph_validate_semantics(const Graph *g);
+ 
++/* Assigns Node->stratum to every node in the graph, based on the same SCC
++ * condensation used for stratifiability checking (one stratum per SCC,
++ * +1 when crossing a negation edge). Call only after graph_validate_semantics
++ * has returned is_valid=1 — on a non-stratifiable graph the result is
++ * meaningless, since no valid stratification exists. */
++void graph_compute_strata(Graph *g);
++
+ /* Free validation result */
+ void validation_result_free(ValidationResult *result);
+ 
+diff --git a/include/synthesizer.h b/include/synthesizer.h
+index 782e7fe..7fb799d 100644
+--- a/include/synthesizer.h
++++ b/include/synthesizer.h
+@@ -41,6 +41,11 @@ typedef struct Rule {
+     ArgBinding *arg_bindings;
+     int arg_binding_count;
+     
++    /* Evaluation stratum, copied from the source Node's graph_compute_strata()
++     * result. saturate() must apply rules in non-decreasing stratum order,
++     * running each stratum to its own fixpoint before moving to the next. */
++    int stratum;
++    
+     struct Rule *next;
+ } Rule;
+ 
+diff --git a/src/main.c b/src/main.c
+index f62cc15..7e0e068 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -318,6 +318,11 @@ int main(int argc, char **argv) {
+         goto cleanup;
+     }
+     
++    /* Stage 4.5: Assign evaluation strata now that we know the graph is
++     * stratifiable — reuses the SCC condensation graph_validate_semantics
++     * already computed rather than a second, independent notion of stratum. */
++    graph_compute_strata(trans.graph);
++    
+     /* Stage 5: Synthesize Closure IR */
+     if (cfg.verbose) printf("[5] Synthesizing closure operator...\n");
+     closure = synthesize(trans.graph);
+@@ -335,16 +340,7 @@ int main(int argc, char **argv) {
+     config = config_new();
+     for (int i = 0; i < parse.program->input_count; i++) {
+         const InputFact *f = &parse.program->inputs[i];
+-        switch (f->arg_count) {
+-            case 1: config_add_fact(config, f->predicate, 1, f->args[0]); break;
+-            case 2: config_add_fact(config, f->predicate, 2, f->args[0], f->args[1]); break;
+-            case 3: config_add_fact(config, f->predicate, 3, f->args[0], f->args[1], f->args[2]); break;
+-            default:
+-                if (cfg.verbose) {
+-                    printf("    (skipping fact with %d args — not supported)\n", f->arg_count);
+-                }
+-                break;
+-        }
++        add_fact_direct(config, f->predicate, f->arg_count, f->args);
+     }
+     if (cfg.verbose) {
+         printf("    ✓ Loaded\n");
+diff --git a/src/runtime.c b/src/runtime.c
+index b7cc4f8..ce56f33 100644
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -1,5 +1,6 @@
+ #include "runtime.h"
+ #include "synthesizer.h"
++#include "limits_superlang.h"
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdio.h>
+@@ -90,7 +91,11 @@ static int fact_exists(Config *c, const char *pred, int arity, char **args) {
+     return 0;
+ }
+ 
+-static void add_fact_direct(Config *c, const char *pred, int arity, char **args) {
++/* Not static: exposed via runtime.h as config_add_fact_arr() so callers
++ * that already have an arg array (e.g. main.c loading input facts) aren't
++ * forced through config_add_fact()'s varargs interface, which is why input
++ * loading previously only handled arity 1-3 and silently dropped the rest. */
++void add_fact_direct(Config *c, const char *pred, int arity, char **args) {
+     if (fact_exists(c, pred, arity, args)) return;
+     Fact *f = calloc(1, sizeof(Fact));
+     f->predicate = strdup(pred);
+@@ -314,7 +319,7 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
+         for (int j = 0; j < g->key_count; j++) args[ai++] = g->key[j];
+ 
+         char buf[64];
+-        if (result == (int)result && fabs(result) < 1e15)
++        if (fabs(result) < 1e15 && result == (int)result)
+             snprintf(buf, sizeof(buf), "%d", (int)result);
+         else
+             snprintf(buf, sizeof(buf), "%.2f", result);
+@@ -340,15 +345,15 @@ static int apply_rule_aggregate(Config *c, const Rule *r) {
+ 
+ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+     int added = 0;
+-    int regular_slots[16], regular_count = 0;
+-    for (int i = 0; i < r->body_count && regular_count < 16; i++) {
++    int regular_slots[SUPERLANG_MAX_BODY_ATOMS], regular_count = 0;
++    for (int i = 0; i < r->body_count && regular_count < SUPERLANG_MAX_BODY_ATOMS; i++) {
+         if (strcmp(r->body_preds[i], "__arith__") != 0)
+             regular_slots[regular_count++] = i;
+     }
+     if (regular_count == 0) return added;
+ 
+-    Fact **fact_lists[16];
+-    int fact_counts[16];
++    Fact **fact_lists[SUPERLANG_MAX_BODY_ATOMS];
++    int fact_counts[SUPERLANG_MAX_BODY_ATOMS];
+     for (int s = 0; s < regular_count; s++) {
+         int slot = regular_slots[s];
+         fact_lists[s] = NULL;
+@@ -365,18 +370,18 @@ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+         }
+     }
+ 
+-    int atom_to_pos[32];
+-    for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
++    int atom_to_pos[SUPERLANG_MAX_BODY_ATOMS];
++    for (int i = 0; i < SUPERLANG_MAX_BODY_ATOMS; i++) atom_to_pos[i] = -1;
+     for (int s = 0; s < regular_count; s++) atom_to_pos[regular_slots[s]] = s;
+ 
+-    int indices[16] = {0};
++    int indices[SUPERLANG_MAX_BODY_ATOMS] = {0};
+     while (1) {
+         int valid = 1;
+         for (int s = 0; s < regular_count; s++)
+             if (indices[s] >= fact_counts[s]) { valid = 0; break; }
+         if (!valid) break;
+ 
+-        Fact *current_facts[16];
++        Fact *current_facts[SUPERLANG_MAX_BODY_ATOMS];
+         for (int s = 0; s < regular_count; s++)
+             current_facts[s] = fact_lists[s][indices[s]];
+ 
+@@ -387,14 +392,34 @@ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+         for (int b = 0; b < r->arg_binding_count && combination_valid; b++) {
+             ArgBinding *bind = &r->arg_bindings[b];
+             if (bind->location_count == 0) { binding_values[b] = NULL; continue; }
+-            ArgLocation *first = &bind->locations[0];
+-            int pos = atom_to_pos[first->atom_index];
+-            if (pos < 0) { combination_valid = 0; break; }
+-            char *value = current_facts[pos]->args[first->arg_index];
++            /* Find the first occurrence that sits in a POSITIVE atom (order-
++             * independent: don't assume locations[0] is positive, even though
++             * ast_to_graph.c currently emits positive atoms before negative
++             * ones). Occurrences inside negative atoms are validated later,
++             * in the negation-check block below, via fact_exists() — they
++             * must never be treated as an unbound/invalid combination here. */
++            int first_pos_loc = -1;
++            for (int l = 0; l < bind->location_count; l++) {
++                if (atom_to_pos[bind->locations[l].atom_index] >= 0) {
++                    first_pos_loc = l;
++                    break;
++                }
++            }
++            if (first_pos_loc < 0) {
++                /* Variable never occurs in a positive atom. type_checker.c's
++                 * safety pass rejects such rules at compile time, so this is
++                 * a defensive fallback for an invariant violation elsewhere,
++                 * not an expected runtime path. */
++                combination_valid = 0;
++                break;
++            }
++            int pos = atom_to_pos[bind->locations[first_pos_loc].atom_index];
++            char *value = current_facts[pos]->args[bind->locations[first_pos_loc].arg_index];
+             binding_values[b] = value;
+-            for (int l = 1; l < bind->location_count; l++) {
++            for (int l = 0; l < bind->location_count; l++) {
++                if (l == first_pos_loc) continue;
+                 int p = atom_to_pos[bind->locations[l].atom_index];
+-                if (p < 0) { combination_valid = 0; break; }
++                if (p < 0) continue; /* negative-atom occurrence; checked later */
+                 if (strcmp(value, current_facts[p]->args[bind->locations[l].arg_index]) != 0) {
+                     combination_valid = 0; break;
+                 }
+@@ -424,7 +449,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+ 
+             if (combination_valid) {
+                 /* ИЗМЕНЕНИЕ v1.2: Вычисление ВСЕЙ арифметики */
+-                double arith_vals[16] = {0};
++                double arith_vals[SUPERLANG_MAX_BODY_ATOMS] = {0};
+                 for (int i = 0; i < r->body_count; i++) {
+                     if (r->arith_exprs[i]) {
+                         arith_vals[i] = eval_expr(r->arith_exprs[i], &vbinds);
+@@ -459,7 +484,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+                         if (arith_slot >= 0) {
+                             char buf[64];
+                             double val = arith_vals[arith_slot];
+-                            if (val == (int)val && fabs(val) < 1e15)
++                            if (fabs(val) < 1e15 && val == (int)val)
+                                 snprintf(buf, sizeof(buf), "%d", (int)val);
+                             else
+                                 snprintf(buf, sizeof(buf), "%.2f", val);
+@@ -508,7 +533,7 @@ static int apply_rule_arithmetic(Config *c, const Rule *r) {
+ static int apply_rule_general(Config *c, const Rule *r) {
+     if (r->body_count == 0) return 0;
+ 
+-    int pos_indices[32], neg_indices[32];
++    int pos_indices[SUPERLANG_MAX_BODY_ATOMS], neg_indices[SUPERLANG_MAX_BODY_ATOMS];
+     int pos_count = 0, neg_count = 0;
+     for (int i = 0; i < r->body_count; i++) {
+         if (r->body_negative[i]) neg_indices[neg_count++] = i;
+@@ -517,8 +542,8 @@ static int apply_rule_general(Config *c, const Rule *r) {
+ 
+     if (pos_count == 0) return 0;
+ 
+-    Fact **fact_lists[32];
+-    int fact_counts[32];
++    Fact **fact_lists[SUPERLANG_MAX_BODY_ATOMS];
++    int fact_counts[SUPERLANG_MAX_BODY_ATOMS];
+     for (int p = 0; p < pos_count; p++) {
+         int slot = pos_indices[p];
+         fact_lists[p] = NULL;
+@@ -535,11 +560,11 @@ static int apply_rule_general(Config *c, const Rule *r) {
+         }
+     }
+ 
+-    int atom_to_pos[32];
+-    for (int i = 0; i < 32; i++) atom_to_pos[i] = -1;
++    int atom_to_pos[SUPERLANG_MAX_BODY_ATOMS];
++    for (int i = 0; i < SUPERLANG_MAX_BODY_ATOMS; i++) atom_to_pos[i] = -1;
+     for (int p = 0; p < pos_count; p++) atom_to_pos[pos_indices[p]] = p;
+ 
+-    int indices[32] = {0};
++    int indices[SUPERLANG_MAX_BODY_ATOMS] = {0};
+     int added = 0;
+ 
+     while (1) {
+@@ -548,7 +573,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
+             if (indices[p] >= fact_counts[p]) { valid = 0; break; }
+         if (!valid) break;
+ 
+-        Fact *current_facts[32];
++        Fact *current_facts[SUPERLANG_MAX_BODY_ATOMS];
+         for (int p = 0; p < pos_count; p++)
+             current_facts[p] = fact_lists[p][indices[p]];
+ 
+@@ -559,14 +584,34 @@ static int apply_rule_general(Config *c, const Rule *r) {
+         for (int b = 0; b < r->arg_binding_count && combination_valid; b++) {
+             ArgBinding *bind = &r->arg_bindings[b];
+             if (bind->location_count == 0) { binding_values[b] = NULL; continue; }
+-            ArgLocation *first = &bind->locations[0];
+-            int pos = atom_to_pos[first->atom_index];
+-            if (pos < 0) { combination_valid = 0; break; }
+-            char *value = current_facts[pos]->args[first->arg_index];
++            /* Find the first occurrence that sits in a POSITIVE atom (order-
++             * independent: don't assume locations[0] is positive, even though
++             * ast_to_graph.c currently emits positive atoms before negative
++             * ones). Occurrences inside negative atoms are validated later,
++             * in the negation-check block below, via fact_exists() — they
++             * must never be treated as an unbound/invalid combination here. */
++            int first_pos_loc = -1;
++            for (int l = 0; l < bind->location_count; l++) {
++                if (atom_to_pos[bind->locations[l].atom_index] >= 0) {
++                    first_pos_loc = l;
++                    break;
++                }
++            }
++            if (first_pos_loc < 0) {
++                /* Variable never occurs in a positive atom. type_checker.c's
++                 * safety pass rejects such rules at compile time, so this is
++                 * a defensive fallback for an invariant violation elsewhere,
++                 * not an expected runtime path. */
++                combination_valid = 0;
++                break;
++            }
++            int pos = atom_to_pos[bind->locations[first_pos_loc].atom_index];
++            char *value = current_facts[pos]->args[bind->locations[first_pos_loc].arg_index];
+             binding_values[b] = value;
+-            for (int l = 1; l < bind->location_count; l++) {
++            for (int l = 0; l < bind->location_count; l++) {
++                if (l == first_pos_loc) continue;
+                 int p = atom_to_pos[bind->locations[l].atom_index];
+-                if (p < 0) { combination_valid = 0; break; }
++                if (p < 0) continue; /* negative-atom occurrence; checked later */
+                 if (strcmp(value, current_facts[p]->args[bind->locations[l].arg_index]) != 0) {
+                     combination_valid = 0; break;
+                 }
+@@ -579,7 +624,7 @@ static int apply_rule_general(Config *c, const Rule *r) {
+                 const char *neg_pred = r->body_preds[slot];
+                 int neg_arity = r->body_arities[slot];
+                 
+-                char *neg_args[32];
++                char *neg_args[SUPERLANG_MAX_ARITY];
+                 for (int a = 0; a < neg_arity; a++) neg_args[a] = NULL;
+                 
+                 for (int b = 0; b < r->arg_binding_count; b++) {
+@@ -663,17 +708,35 @@ static int apply_rule(Config *c, const Rule *r) {
+ 
+ void saturate(Config *c, const ClosureIR *closure) {
+     if (!c || !closure) return;
+-    
+-    int changed = 1;
+-    int max_iterations = 100;
+-    int iteration = 0;
+-    
+-    while (changed && iteration < max_iterations) {
+-        changed = 0;
+-        for (Rule *r = closure->rules; r; r = r->next) {
+-            int added = apply_rule(c, r);
+-            if (added > 0) changed = 1;
++
++    /* Rules must be applied in non-decreasing stratum order, running each
++     * stratum to its own fixpoint before advancing — that is the entire
++     * point of stratification: a negated predicate must be fully computed
++     * before any rule that negates it runs, or a rule can permanently commit
++     * a fact based on an incomplete view of what it negates (this engine
++     * has no retraction, so such a fact can never later be corrected).
++     * r->stratum is precomputed by graph_compute_strata() from the same SCC
++     * condensation that graph_validate_semantics() uses to reject
++     * non-stratifiable programs, so this loop can trust it directly instead
++     * of re-deriving stratum order here. */
++    int max_stratum = 0;
++    for (Rule *r = closure->rules; r; r = r->next) {
++        if (r->stratum > max_stratum) max_stratum = r->stratum;
++    }
++
++    int max_iterations = 10000; /* fixpoint safety cap per stratum */
++
++    for (int s = 0; s <= max_stratum; s++) {
++        int changed = 1;
++        int iteration = 0;
++        while (changed && iteration < max_iterations) {
++            changed = 0;
++            for (Rule *r = closure->rules; r; r = r->next) {
++                if (r->stratum != s) continue;
++                int added = apply_rule(c, r);
++                if (added > 0) changed = 1;
++            }
++            iteration++;
+         }
+-        iteration++;
+     }
+ }
+diff --git a/src/semantic_validator.c b/src/semantic_validator.c
+index 87ebd36..330917b 100644
+--- a/src/semantic_validator.c
++++ b/src/semantic_validator.c
+@@ -60,24 +60,26 @@ static void tarjan_state_free(TarjanState *state) {
+     free(state);
+ }
+ 
+-/* Build array of node pointers from linked list for indexed access.
++/* Build array of node pointers from linked list for indexed access, and
++ * stamp each Node with its array index (temp_idx) so lookups are O(1)
++ * instead of an O(node_count) scan per edge — that scan previously made
++ * the whole SCC pass O(V*E) rather than Tarjan's proper O(V+E).
+  * Caller must free the returned array (but not the Nodes it points to). */
+ static Node **build_nodes_array(const Graph *g) {
+     Node **arr = malloc(g->node_count * sizeof(Node*));
+     if (!arr) return NULL;
+     size_t i = 0;
+     for (Node *n = g->nodes; n && i < g->node_count; n = n->next) {
++        n->temp_idx = (int)i;
+         arr[i++] = n;
+     }
+     return arr;
+ }
+ 
+-/* Find index of target node in array. Returns -1 if not found. */
++/* O(1): the index was stamped onto the node itself by build_nodes_array(). */
+ static int find_node_index(Node **nodes_arr, size_t node_count, const Node *target) {
+-    for (size_t i = 0; i < node_count; i++) {
+-        if (nodes_arr[i] == target) return (int)i;
+-    }
+-    return -1;
++    (void)nodes_arr; (void)node_count;
++    return target->temp_idx;
+ }
+ 
+ static void tarjan_strongconnect(Node **nodes_arr, size_t node_count,
+@@ -90,11 +92,20 @@ static void tarjan_strongconnect(Node **nodes_arr, size_t node_count,
+ 
+     Node *node = nodes_arr[v];
+     for (Edge *e = node->outgoing; e; e = e->next) {
+-        /* Only dependency edges form the SCC graph */
++        /* Only dependency edges form the SCC graph. EDGE_DEFINED_BY_AGGREGATE
++         * is included: it is a genuine cross-predicate dependency (the
++         * aggregate's source predicate), and excluding it previously let a
++         * negative cycle routed through an aggregate go undetected as
++         * "stratifiable" when it wasn't. FILTER/ARITHMETIC edges are real
++         * self-loops by construction (ast_to_graph.c always sets their
++         * target to the same node they originate from) and stay excluded,
++         * since including them would just add meaningless self-loops for
++         * every rule that happens to use a comparison or arithmetic. */
+         if (e->type != EDGE_DEFINED_BY_COMPOSITION &&
+             e->type != EDGE_DEFINED_BY_RECURSIVE &&
+             e->type != EDGE_DEFINED_BY_NEGATION &&
+-            e->type != EDGE_DEFINED_BY_BASE) {
++            e->type != EDGE_DEFINED_BY_BASE &&
++            e->type != EDGE_DEFINED_BY_AGGREGATE) {
+             continue;
+         }
+ 
+@@ -293,8 +304,76 @@ ValidationResult graph_validate_semantics(const Graph *g) {
+ }
+ 
+ /* ====================================================================== */
+-/* Result helpers                                                          */
++/* Stratum assignment                                                      */
+ /* ====================================================================== */
++/*
++ * Assigns one stratum number to every node, derived from the SAME SCC
++ * condensation used above to reject non-stratifiable programs — rather
++ * than a second, independent per-rule heuristic (the previous approach,
++ * which could assign a copy-rule a lower stratum than the impl rule it
++ * copies from, whenever negation pushed the impl rule above stratum 0).
++ *
++ * Tarjan's algorithm emits SCCs in reverse topological order of the
++ * condensation DAG: if SCC A has an edge to a *different* SCC B (A
++ * depends on B), B is always emitted before A. Processing state->sccs
++ * in emission order (0, 1, 2, ...) therefore guarantees that by the time
++ * SCC i is processed, every other SCC it points to already has a final
++ * stratum. Edges back into the same SCC are skipped when computing the
++ * requirement (mutual/self recursion shares one stratum, and
++ * graph_validate_semantics already guarantees no such edge is a negation,
++ * or the program would have been rejected before this ever runs).
++ */
++void graph_compute_strata(Graph *g) {
++    if (!g || g->node_count == 0) return;
++
++    Node **nodes_arr = build_nodes_array(g);
++    if (!nodes_arr) return;
++
++    TarjanState *state = tarjan_find_sccs(g, nodes_arr);
++    if (!state) { free(nodes_arr); return; }
++
++    int *node_to_scc = malloc(g->node_count * sizeof(int));
++    int *scc_stratum = calloc((size_t)state->scc_count, sizeof(int));
++    for (int i = 0; i < state->scc_count; i++) {
++        for (int j = 0; j < state->scc_sizes[i]; j++) {
++            node_to_scc[state->sccs[i][j]] = i;
++        }
++    }
++
++    for (int i = 0; i < state->scc_count; i++) {
++        int max_required = 0;
++        for (int j = 0; j < state->scc_sizes[i]; j++) {
++            Node *node = nodes_arr[state->sccs[i][j]];
++            for (Edge *e = node->outgoing; e; e = e->next) {
++                if (e->type != EDGE_DEFINED_BY_COMPOSITION &&
++                    e->type != EDGE_DEFINED_BY_RECURSIVE &&
++                    e->type != EDGE_DEFINED_BY_NEGATION &&
++                    e->type != EDGE_DEFINED_BY_BASE &&
++                    e->type != EDGE_DEFINED_BY_AGGREGATE) {
++                    continue;
++                }
++                int target_scc = node_to_scc[e->target->temp_idx];
++                if (target_scc == i) continue; /* internal edge, no bump */
++                int required = scc_stratum[target_scc] +
++                                (e->type == EDGE_DEFINED_BY_NEGATION ? 1 : 0);
++                if (required > max_required) max_required = required;
++            }
++        }
++        scc_stratum[i] = max_required;
++    }
++
++    for (int i = 0; i < state->scc_count; i++) {
++        for (int j = 0; j < state->scc_sizes[i]; j++) {
++            nodes_arr[state->sccs[i][j]]->stratum = scc_stratum[i];
++        }
++    }
++
++    free(node_to_scc);
++    free(scc_stratum);
++    tarjan_state_free(state);
++    free(nodes_arr);
++}
++
+ 
+ void validation_result_free(ValidationResult *r) {
+     if (!r) return;
+diff --git a/src/synthesizer.c b/src/synthesizer.c
+index 11f1297..ac86cd3 100644
+--- a/src/synthesizer.c
++++ b/src/synthesizer.c
+@@ -328,6 +328,7 @@ ClosureIR *synthesize(const Graph *g) {
+                 if (e->type != EDGE_DEFINED_BY_BASE) continue;
+                 Rule *r = calloc(1, sizeof(Rule));
+                 r->head = strdup(n->name);
++                r->stratum = n->stratum;
+                 r->head_arity = n->arity;
+                 r->body_count = 1;
+                 r->body_preds = malloc(sizeof(char*));
+@@ -364,6 +365,7 @@ ClosureIR *synthesize(const Graph *g) {
+         if (agg_edge) {
+             Rule *r = calloc(1, sizeof(Rule));
+             r->head = strdup(n->name);
++            r->stratum = n->stratum;
+             r->head_arity = n->arity;
+             r->body_count = 1;
+             r->body_preds = malloc(sizeof(char*));
+@@ -425,6 +427,7 @@ ClosureIR *synthesize(const Graph *g) {
+                 
+                 Rule *r = calloc(1, sizeof(Rule));
+                 r->head = strdup(n->name);
++                r->stratum = n->stratum;
+                 r->head_arity = n->arity;
+                 r->body_count = total_count;
+                 r->body_preds = calloc(total_count, sizeof(char*));
+@@ -523,6 +526,7 @@ ClosureIR *synthesize(const Graph *g) {
+ 
+         Rule *r = calloc(1, sizeof(Rule));
+         r->head = strdup(n->name);
++        r->stratum = n->stratum;
+         r->head_arity = n->arity;
+         r->body_count = body_count;
+         r->body_preds = malloc(sizeof(char*) * body_count);
+diff --git a/src/type_checker.c b/src/type_checker.c
+index e9ca608..c50402b 100644
+--- a/src/type_checker.c
++++ b/src/type_checker.c
+@@ -1,4 +1,5 @@
+ #include "type_checker.h"
++#include "limits_superlang.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -200,6 +201,29 @@ static void collect_expr_vars(const Expr *e, VarSet *vars) {
+ 
+ static void check_condition(const Condition *cond, const PredTable *preds,
+                             VarSet *bound_vars, TypeCheckResult *result) {
++    /* Pass 0: reject rules that runtime.c's fixed-size stack buffers
++     * (atom_to_pos[], neg_args[], etc. — sized from these same constants)
++     * cannot hold. Catching this here, at compile time, turns what would
++     * otherwise be a silent stack buffer overflow (too many body atoms) or
++     * silent truncation (too many arguments) into a clear error. */
++    int total_slots = cond->atom_count + cond->arith_count;
++    if (total_slots > SUPERLANG_MAX_BODY_ATOMS) {
++        char msg[256];
++        snprintf(msg, sizeof(msg),
++                 "Rule body has %d atoms/arithmetic-assignments; maximum supported is %d",
++                 total_slots, SUPERLANG_MAX_BODY_ATOMS);
++        result_add(result, msg, cond->loc.line, cond->loc.column, NULL);
++    }
++    for (int i = 0; i < cond->atom_count; i++) {
++        if (cond->atoms[i].arg_count > SUPERLANG_MAX_ARITY) {
++            char msg[256];
++            snprintf(msg, sizeof(msg),
++                     "Predicate '%s' used with %d arguments; maximum supported is %d",
++                     cond->atoms[i].predicate, cond->atoms[i].arg_count, SUPERLANG_MAX_ARITY);
++            result_add(result, msg, cond->atoms[i].loc.line, cond->atoms[i].loc.column, NULL);
++        }
++    }
++
+     /* Pass 1: bind variables from positive atoms */
+     for (int i = 0; i < cond->atom_count; i++) {
+         const Atom *a = &cond->atoms[i];
+diff --git a/tests/run_semantic_tests.sh b/tests/run_semantic_tests.sh
+index 10b7110..8fcea83 100755
+--- a/tests/run_semantic_tests.sh
++++ b/tests/run_semantic_tests.sh
+@@ -1,4 +1,13 @@
+ #!/bin/bash
++# SuperLang semantic regression suite.
++#
++# Unlike the previous version of this script, this one does not stop at
++# checking the exit code. A program can exit 0 while every single query
++# result printed is wrong (this actually happened: test3/test4 "passed"
++# for months while printing FALSE for answers that should have been TRUE).
++# Each test below also asserts that specific, exact strings appear in the
++# output — the query results the test is named for, verified by hand
++# against the input facts, not just eyeballed.
+ 
+ echo "======================================"
+ echo "SuperLang Semantic Test Suite"
+@@ -8,64 +17,140 @@ echo ""
+ PASS=0
+ FAIL=0
+ 
++# run_test <file> <description> <expected_exit> <expected_string_1> [expected_string_2] ...
++# Every expected_string_N must appear verbatim (as a literal substring) in
++# the combined stdout+stderr output, or the test fails — regardless of
++# exit code.
+ run_test() {
+     local file=$1
+     local description=$2
+     local expected_exit=$3
+-    
++    shift 3
++    local expected_strings=("$@")
++
+     echo "Testing: $description"
+     echo "File: $file"
+-    
++
+     output=$(./superlang "$file" 2>&1)
+     exit_code=$?
+-    
++
++    local ok=1
++
+     if [ $exit_code -ne $expected_exit ]; then
+         echo "✗ FAIL: Exit code $exit_code (expected $expected_exit)"
+-        FAIL=$((FAIL + 1))
+-        return 1
++        ok=0
++    else
++        echo "✓ Exit code correct ($exit_code)"
+     fi
+-    
+-    echo "✓ Exit code correct ($exit_code)"
+-    
+-    # Выводим результат для ручной проверки
++
++    for expected in "${expected_strings[@]}"; do
++        if [[ "$output" == *"$expected"* ]]; then
++            echo "✓ Found: $expected"
++        else
++            echo "✗ FAIL: Expected output not found: $expected"
++            ok=0
++        fi
++    done
++
+     echo "--- Output ---"
+-    echo "$output" | grep -A 20 "QUERY RESULTS" || echo "$output"
++    echo "$output" | grep -A 30 "QUERY RESULTS\|FAILED" || echo "$output"
+     echo "--------------"
+     echo ""
+-    
+-    PASS=$((PASS + 1))
+-    return 0
++
++    if [ $ok -eq 1 ]; then
++        PASS=$((PASS + 1))
++    else
++        FAIL=$((FAIL + 1))
++    fi
+ }
+ 
+-# Test 1: Ancestor (рекурсия)
+-run_test "tests/test1_ancestor.unq" "Recursive ancestor relationship" 0
++# Test 1: Ancestor (recursion, no negation — every stratum lands at 0)
++run_test "tests/test1_ancestor.unq" "Recursive ancestor relationship" 0 \
++    "ancestor(Alice, Bob)
++       → TRUE" \
++    "ancestor(Alice, David)
++       → TRUE" \
++    "ancestor(David, Alice)
++       → FALSE"
+ 
+-# Test 2: Connected components
+-run_test "tests/test2_connected.unq" "Transitive closure (connected)" 0
++# Test 2: Connected components (recursion via multiple derive clauses / union)
++run_test "tests/test2_connected.unq" "Transitive closure (connected)" 0 \
++    "connected(A, B)
++       → TRUE" \
++    "connected(A, D)
++       → FALSE" \
++    "connected(D, E)
++       → TRUE"
+ 
+-# Test 3: Depends (negation)
+-run_test "tests/test3_depends.unq" "Stratified negation (depends/blocked)" 0
++# Test 3: Depends/blocked (stratified negation, pattern-match query)
++# T3 depends on T2 (not finished) -> T3 is the only blocked task.
++run_test "tests/test3_depends.unq" "Stratified negation (depends/blocked)" 0 \
++    "blocked(!ID)
++       → [T3]"
+ 
+-# Test 4: Ready (negation + task scheduling)
+-run_test "tests/test4_ready.unq" "Task readiness with negation" 0
++# Test 4: Ready (negation chained through another negated predicate)
++# This is the exact case that silently returned FALSE/FALSE/FALSE across
++# v1.0-v1.2: the copy-rule/impl-rule stratum mismatch, then the flat
++# unordered fixpoint, then the unification regression.
++run_test "tests/test4_ready.unq" "Task readiness with negation" 0 \
++    "ready(TaskA)
++       → TRUE" \
++    "ready(TaskB)
++       → TRUE" \
++    "ready(TaskC)
++       → FALSE"
+ 
+-# Test 5: Total price (aggregates)
+-run_test "tests/test5_total_price.unq" "Aggregate sum with grouping" 0
++# Test 5: Total price (aggregate sum with grouping)
++run_test "tests/test5_total_price.unq" "Aggregate sum with grouping" 0 \
++    "total_price(Order1, 150)
++       → TRUE" \
++    "total_price(Order2, 200)
++       → TRUE"
+ 
+ # Test 6: Negative cycle (should be rejected)
+-run_test "tests/test6_negative_cycle.unq" "Reject negative cycle" 1
++run_test "tests/test6_negative_cycle.unq" "Reject negative cycle" 1 \
++    "not stratifiable"
+ 
+ # Test 7: Self negation (should be rejected)
+-run_test "tests/test7_self_negation.unq" "Reject self-negation" 1
++run_test "tests/test7_self_negation.unq" "Reject self-negation" 1 \
++    "not stratifiable"
+ 
+ # Test 8: Arithmetic
+-run_test "tests/test8_arith.unq" "Arithmetic expressions" 0
++run_test "tests/test8_arith.unq" "Arithmetic expressions" 0 \
++    "final_price(Widget, 100)
++       → TRUE" \
++    "final_price(Gadget, 200)
++       → TRUE"
+ 
+-# Test 9: Typo (should be rejected)
+-run_test "tests/test9_typo.unq" "Reject undefined predicate" 1
++# Test 9: Typo (should be rejected, with all specific diagnostics present)
++run_test "tests/test9_typo.unq" "Reject undefined predicate / unsafe rules" 1 \
++    "Unknown predicate 'blockd'" \
++    "Safety violation: variable 'other' used in negated atom 'Finished'" \
++    "Safety violation: head variable 't' of derive 'broken_rule' not bound in body" \
++    "Arity mismatch for 'Task'"
+ 
+-# Test 10: Built-in math functions
+-run_test "experiments/test_builtin.unq" "Built-in math (sqrt, pow, etc.)" 0
++# Test 10: Negative recursion through an aggregate edge (should be rejected)
++run_test "tests/test10_aggregate_cycle.unq" "Reject negative cycle through an aggregate" 1 \
++    "not stratifiable"
++
++# Test 11: Deep negation chain (4 levels -> 4 strata, must alternate)
++run_test "tests/test11_deep_negation_chain.unq" "Deep negation chain (4 strata)" 0 \
++    "a(k1)
++       → TRUE" \
++    "b(k1)
++       → FALSE" \
++    "c(k1)
++       → TRUE" \
++    "d(k1)
++       → FALSE"
++
++# Test 12: Built-in math functions
++if [ -f "experiments/test_builtin.unq" ]; then
++    run_test "experiments/test_builtin.unq" "Built-in math (sqrt, pow, etc.)" 0 \
++        "distance(!X, !Y, !D)" \
++        "(5, 12, 13)" \
++        "(0, 10, 10)"
++fi
+ 
+ echo "======================================"
+ echo "Summary: $PASS passed, $FAIL failed"
+diff --git a/tests/run_tests.sh b/tests/run_tests.sh
+deleted file mode 100755
+index 28f3909..0000000
+--- a/tests/run_tests.sh
++++ /dev/null
+@@ -1,78 +0,0 @@
+-#!/bin/bash
+-
+-set -e
+-
+-SUPERLANG="./superlang"
+-TESTS_DIR="examples"
+-
+-echo "====================================="
+-echo "SuperLang Regression Test Suite"
+-echo "====================================="
+-echo ""
+-
+-# Colors for output
+-GREEN='\033[0;32m'
+-RED='\033[0;31m'
+-NC='\033[0m' # No Color
+-
+-pass_count=0
+-fail_count=0
+-
+-run_test() {
+-    local test_name="$1"
+-    local test_file="$2"
+-    local expected_exit="$3"
+-    
+-    echo "Running: $test_name"
+-    
+-    if [ ! -f "$test_file" ]; then
+-        echo -e "${RED}✗ FAIL: Test file not found: $test_file${NC}"
+-        fail_count=$((fail_count + 1))
+-        return
+-    fi
+-    
+-    # Run the test
+-    set +e
+-    output=$($SUPERLANG "$test_file" 2>&1)
+-    actual_exit=$?
+-    set -e
+-    
+-    if [ "$actual_exit" -eq "$expected_exit" ]; then
+-        echo -e "${GREEN}✓ PASS: $test_name (exit code: $actual_exit)${NC}"
+-        pass_count=$((pass_count + 1))
+-    else
+-        echo -e "${RED}✗ FAIL: $test_name (expected exit $expected_exit, got $actual_exit)${NC}"
+-        echo "$output"
+-        fail_count=$((fail_count + 1))
+-    fi
+-    echo ""
+-}
+-
+-# Positive tests (should succeed with exit code 0)
+-run_test "Test 1: Ancestor (transitive closure)" "$TESTS_DIR/test1_ancestor.unq" 0
+-run_test "Test 2: Connected (symmetric closure)" "$TESTS_DIR/test2_connected.unq" 0
+-run_test "Test 3: Depends (task dependencies)" "$TESTS_DIR/test3_depends.unq" 0
+-run_test "Test 4: Ready (stratified negation)" "$TESTS_DIR/task_ready.unq" 0
+-run_test "Test 5: Total Price (aggregates)" "$TESTS_DIR/total_price.unq" 0
+-run_test "Test 8: Arithmetic (basic)" "$TESTS_DIR/test_arith.unq" 0
+-
+-# Negative tests (should fail with exit code 1)
+-run_test "Test 6: Negative Cycle (validator rejection)" "$TESTS_DIR/test6_negative_cycle.unq" 1
+-run_test "Test 7: Self-Negation (validator rejection)" "$TESTS_DIR/test7_self_negation.unq" 1
+-run_test "TypeChecker: Typo Test (type checker rejection)" "$TESTS_DIR/typo_test.unq" 1
+-
+-# Summary
+-echo "====================================="
+-echo "Test Summary"
+-echo "====================================="
+-echo -e "${GREEN}Passed: $pass_count${NC}"
+-echo -e "${RED}Failed: $fail_count${NC}"
+-echo ""
+-
+-if [ "$fail_count" -eq 0 ]; then
+-    echo -e "${GREEN}✓ ALL TESTS PASSED${NC}"
+-    exit 0
+-else
+-    echo -e "${RED}✗ SOME TESTS FAILED${NC}"
+-    exit 1
+-fi
+diff --git a/tests/test10_aggregate_cycle.unq b/tests/test10_aggregate_cycle.unq
+new file mode 100644
+index 0000000..45223bf
+--- /dev/null
++++ b/tests/test10_aggregate_cycle.unq
+@@ -0,0 +1,32 @@
++# Test 10: Negative recursion through an AGGREGATE edge
++# Regression test for a validator gap: EDGE_DEFINED_BY_AGGREGATE was
++# excluded from the SCC dependency graph in semantic_validator.c, so a
++# negative cycle closed by an aggregate dependency (rather than a plain
++# composition/negation edge, as in test6/test7) went undetected and was
++# silently accepted as "stratifiable" when it is not.
++#
++# Paradox, spelled out: if mid(a,1) holds, count_high_flag(a) becomes true
++# (count=1>0), so "not count_high_flag(a)" becomes false, so mid(a,1) must
++# NOT hold — contradiction. If mid(a,1) does not hold, the count is 0, so
++# count_high_flag(a) is false, so "not count_high_flag(a)" holds, so
++# mid(a,1) (from Base(a,1)) must hold — contradiction either way. No
++# stable model exists: this must be rejected, exactly like test6/test7.
++
++relation Base(K, V)
++
++derive count_high(k, cnt) from
++    cnt = count(mid(k, v), v)
++
++derive count_high_flag(k) from
++    count_high(k, cnt), cnt > 0
++
++derive mid(k, v) from
++    Base(k, v), not count_high_flag(k)
++
++input {
++    Base(a, 1)
++}
++
++query mid(a, 1)
++query count_high(a, 1)
++query count_high_flag(a)
+diff --git a/tests/test11_deep_negation_chain.unq b/tests/test11_deep_negation_chain.unq
+new file mode 100644
+index 0000000..6a39d77
+--- /dev/null
++++ b/tests/test11_deep_negation_chain.unq
+@@ -0,0 +1,29 @@
++# Test 11: Deep negation chain (4 levels)
++# Regression test for the v1.1/v1.1.1/v1.1.2 stratification bugs:
++#   - a copy-rule (P :- P_impl_N) must never run in an earlier stratum than
++#     the impl rule it copies from (v1.1.1: it did, so P stayed empty forever)
++#   - removing stratification entirely and evaluating all rules in one flat,
++#     unordered fixpoint is not a fix: with no fact retraction, a rule that
++#     negates a predicate which is not yet fully computed can permanently
++#     commit a wrong fact (v1.2 fell into exactly this)
++#   - a variable bound by a positive atom and also checked in a negative
++#     atom must unify correctly, not be rejected outright (v1.1.2 regression)
++#
++# a(x) is a base fact. b negates a, c negates b, d negates c: this forces
++# 4 distinct strata and the results must alternate TRUE/FALSE/TRUE/FALSE.
++
++relation base(x)
++
++derive a(x) from base(x)
++derive b(x) from base(x), not a(x)
++derive c(x) from base(x), not b(x)
++derive d(x) from base(x), not c(x)
++
++input {
++    base(k1)
++}
++
++query a(k1)
++query b(k1)
++query c(k1)
++query d(k1)
+-- 
+2.43.0
+

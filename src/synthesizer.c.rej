@@ -1,0 +1,33 @@
+diff a/src/synthesizer.c b/src/synthesizer.c	(rejected hunks)
+@@ -328,6 +328,7 @@ ClosureIR *synthesize(const Graph *g) {
+                 if (e->type != EDGE_DEFINED_BY_BASE) continue;
+                 Rule *r = calloc(1, sizeof(Rule));
+                 r->head = strdup(n->name);
++                r->stratum = n->stratum;
+                 r->head_arity = n->arity;
+                 r->body_count = 1;
+                 r->body_preds = malloc(sizeof(char*));
+@@ -364,6 +365,7 @@ ClosureIR *synthesize(const Graph *g) {
+         if (agg_edge) {
+             Rule *r = calloc(1, sizeof(Rule));
+             r->head = strdup(n->name);
++            r->stratum = n->stratum;
+             r->head_arity = n->arity;
+             r->body_count = 1;
+             r->body_preds = malloc(sizeof(char*));
+@@ -425,6 +427,7 @@ ClosureIR *synthesize(const Graph *g) {
+                 
+                 Rule *r = calloc(1, sizeof(Rule));
+                 r->head = strdup(n->name);
++                r->stratum = n->stratum;
+                 r->head_arity = n->arity;
+                 r->body_count = total_count;
+                 r->body_preds = calloc(total_count, sizeof(char*));
+@@ -523,6 +526,7 @@ ClosureIR *synthesize(const Graph *g) {
+ 
+         Rule *r = calloc(1, sizeof(Rule));
+         r->head = strdup(n->name);
++        r->stratum = n->stratum;
+         r->head_arity = n->arity;
+         r->body_count = body_count;
+         r->body_preds = malloc(sizeof(char*) * body_count);
