@@ -1,0 +1,32 @@
+# Test 10: Negative recursion through an AGGREGATE edge
+# Regression test for a validator gap: EDGE_DEFINED_BY_AGGREGATE was
+# excluded from the SCC dependency graph in semantic_validator.c, so a
+# negative cycle closed by an aggregate dependency (rather than a plain
+# composition/negation edge, as in test6/test7) went undetected and was
+# silently accepted as "stratifiable" when it is not.
+#
+# Paradox, spelled out: if mid(a,1) holds, count_high_flag(a) becomes true
+# (count=1>0), so "not count_high_flag(a)" becomes false, so mid(a,1) must
+# NOT hold — contradiction. If mid(a,1) does not hold, the count is 0, so
+# count_high_flag(a) is false, so "not count_high_flag(a)" holds, so
+# mid(a,1) (from Base(a,1)) must hold — contradiction either way. No
+# stable model exists: this must be rejected, exactly like test6/test7.
+
+relation Base(K, V)
+
+derive count_high(k, cnt) from
+    cnt = count(mid(k, v), v)
+
+derive count_high_flag(k) from
+    count_high(k, cnt), cnt > 0
+
+derive mid(k, v) from
+    Base(k, v), not count_high_flag(k)
+
+input {
+    Base(a, 1)
+}
+
+query mid(a, 1)
+query count_high(a, 1)
+query count_high_flag(a)

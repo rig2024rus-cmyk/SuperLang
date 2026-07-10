@@ -41,6 +41,11 @@ typedef struct Rule {
     ArgBinding *arg_bindings;
     int arg_binding_count;
     
+    /* Evaluation stratum, copied from the source Node's graph_compute_strata()
+     * result. saturate() must apply rules in non-decreasing stratum order,
+     * running each stratum to its own fixpoint before moving to the next. */
+    int stratum;
+    
     struct Rule *next;
 } Rule;
 

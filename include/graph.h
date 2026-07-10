@@ -50,6 +50,8 @@ typedef struct Node {
     int head_param_count;
     Edge *outgoing;
     struct Node *next;
+    int stratum;      /* computed by graph_compute_strata(); valid only after validation passes */
+    int temp_idx;      /* scratch index used by Tarjan's SCC pass; not meaningful outside it */
 } Node;
 
 typedef struct Graph {

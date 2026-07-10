@@ -1,0 +1,29 @@
+# Test 11: Deep negation chain (4 levels)
+# Regression test for the v1.1/v1.1.1/v1.1.2 stratification bugs:
+#   - a copy-rule (P :- P_impl_N) must never run in an earlier stratum than
+#     the impl rule it copies from (v1.1.1: it did, so P stayed empty forever)
+#   - removing stratification entirely and evaluating all rules in one flat,
+#     unordered fixpoint is not a fix: with no fact retraction, a rule that
+#     negates a predicate which is not yet fully computed can permanently
+#     commit a wrong fact (v1.2 fell into exactly this)
+#   - a variable bound by a positive atom and also checked in a negative
+#     atom must unify correctly, not be rejected outright (v1.1.2 regression)
+#
+# a(x) is a base fact. b negates a, c negates b, d negates c: this forces
+# 4 distinct strata and the results must alternate TRUE/FALSE/TRUE/FALSE.
+
+relation base(x)
+
+derive a(x) from base(x)
+derive b(x) from base(x), not a(x)
+derive c(x) from base(x), not b(x)
+derive d(x) from base(x), not c(x)
+
+input {
+    base(k1)
+}
+
+query a(k1)
+query b(k1)
+query c(k1)
+query d(k1)
